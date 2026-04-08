@@ -14,6 +14,8 @@ import androidx.compose.ui.unit.sp
 import androidx.wear.compose.material.*
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
+import androidx.compose.material.icons.filled.Pause
+import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.Remove
 import androidx.compose.material.icons.filled.Replay
 import kotlinx.coroutines.launch
@@ -48,12 +50,22 @@ fun CuePointApp(spotifyApi: SpotifyApi) {
     var minutes by remember { mutableIntStateOf(1) }
     var seconds by remember { mutableIntStateOf(13) }
 
-    // Button state
-    var status by remember { mutableStateOf("") }
-    var isLoading by remember { mutableStateOf(false) }
+    // Playback state – null means unknown (still fetching)
+    // Boolean? ≈ Nullable<bool> in C#
+    var isPlaying by remember { mutableStateOf<Boolean?>(null) }
+
+    // Button states
+    var seekStatus by remember { mutableStateOf("") }
+    var isSeekLoading by remember { mutableStateOf(false) }
+    var isPlayPauseLoading by remember { mutableStateOf(false) }
 
     // Coroutine scope for async operations (≈ async/await context)
     val scope = rememberCoroutineScope()
+
+    // Fetch playback state when the screen opens (≈ OnAppearing in MAUI)
+    LaunchedEffect(Unit) {
+        isPlaying = spotifyApi.isPlaying()
+    }
 
     MaterialTheme {
         // Scaffold = base Wear OS layout (supports round display)
@@ -108,49 +120,73 @@ fun CuePointApp(spotifyApi: SpotifyApi) {
 
                 Spacer(modifier = Modifier.height(8.dp))
 
-                // === SEEK BUTTON ===
-                Button(
-                    onClick = {
-                        if (!isLoading) {
-                            isLoading = true
-                            status = ""
-                            // Convert to milliseconds for Spotify API
-                            val positionMs = (minutes * 60 + seconds) * 1000L
-
-                            // Launch async operation (≈ await SpotifyApi.Seek())
-                            scope.launch {
-                                val result = spotifyApi.seek(positionMs)
-                                status = if (result) "✓" else "✗"
-                                isLoading = false
-                            }
-                        }
-                    },
-                    modifier = Modifier.size(48.dp),
-                    colors = ButtonDefaults.buttonColors(
-                        backgroundColor = Color(0xFF1DB954)
-                    )
+                // === BUTTONS ROW ===
+                Row(
+                    horizontalArrangement = Arrangement.spacedBy(12.dp),
+                    verticalAlignment = Alignment.CenterVertically
                 ) {
-                    if (isLoading) {
-                        CircularProgressIndicator(
-                            modifier = Modifier.size(24.dp),
-                            strokeWidth = 2.dp
-                        )
-                    } else {
-                        Icon(
-                            imageVector = Icons.Default.Replay,
-                            contentDescription = "Seek",
-                            modifier = Modifier.size(24.dp)
-                        )
+                    // --- Play / Pause ---
+                    Button(
+                        onClick = {
+                            if (!isPlayPauseLoading) {
+                                isPlayPauseLoading = true
+                                scope.launch {
+                                    val success = if (isPlaying == true) spotifyApi.pause() else spotifyApi.play()
+                                    if (success) isPlaying = !(isPlaying ?: false)
+                                    isPlayPauseLoading = false
+                                }
+                            }
+                        },
+                        modifier = Modifier.size(48.dp),
+                        colors = ButtonDefaults.buttonColors(backgroundColor = Color(0xFF1DB954))
+                    ) {
+                        if (isPlayPauseLoading) {
+                            CircularProgressIndicator(modifier = Modifier.size(24.dp), strokeWidth = 2.dp)
+                        } else {
+                            Icon(
+                                imageVector = if (isPlaying == true) Icons.Default.Pause else Icons.Default.PlayArrow,
+                                contentDescription = if (isPlaying == true) "Pause" else "Play",
+                                modifier = Modifier.size(24.dp)
+                            )
+                        }
+                    }
+
+                    // --- Seek / Reset ---
+                    Button(
+                        onClick = {
+                            if (!isSeekLoading) {
+                                isSeekLoading = true
+                                seekStatus = ""
+                                val positionMs = (minutes * 60 + seconds) * 1000L
+                                scope.launch {
+                                    val result = spotifyApi.seek(positionMs)
+                                    seekStatus = if (result) "✓" else "✗"
+                                    isSeekLoading = false
+                                }
+                            }
+                        },
+                        modifier = Modifier.size(48.dp),
+                        colors = ButtonDefaults.buttonColors(backgroundColor = Color(0xFF1DB954))
+                    ) {
+                        if (isSeekLoading) {
+                            CircularProgressIndicator(modifier = Modifier.size(24.dp), strokeWidth = 2.dp)
+                        } else {
+                            Icon(
+                                imageVector = Icons.Default.Replay,
+                                contentDescription = "Seek",
+                                modifier = Modifier.size(24.dp)
+                            )
+                        }
                     }
                 }
 
-                // Status text
-                if (status.isNotEmpty()) {
+                // Status text for seek result
+                if (seekStatus.isNotEmpty()) {
                     Spacer(modifier = Modifier.height(4.dp))
                     Text(
-                        text = status,
+                        text = seekStatus,
                         fontSize = 18.sp,
-                        color = if (status == "✓") Color(0xFF1DB954) else Color.Red
+                        color = if (seekStatus == "✓") Color(0xFF1DB954) else Color.Red
                     )
                 }
             }

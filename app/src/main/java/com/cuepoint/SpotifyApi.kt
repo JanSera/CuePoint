@@ -12,6 +12,7 @@ import kotlinx.coroutines.withContext
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
+import org.json.JSONObject
 
 /**
  * Spotify Web API client.
@@ -52,42 +53,88 @@ class SpotifyApi(private val context: Context) {
      *
      * Spotify API: PUT /v1/me/player/seek?position_ms={ms}
      * Scope: user-modify-playback-state
-     * Returns: true = success, false = error
-     *
-     * C# equivalent:
-     *   await _httpClient.PutAsync($"...?position_ms={positionMs}", null);
      */
-    suspend fun seek(positionMs: Long): Boolean = withContext(Dispatchers.IO) {
+    suspend fun seek(positionMs: Long): Boolean =
+        putPlayerCommand("https://api.spotify.com/v1/me/player/seek?position_ms=$positionMs")
+
+    /**
+     * Resumes playback.
+     * Spotify API: PUT /v1/me/player/play
+     */
+    suspend fun play(): Boolean =
+        putPlayerCommand("https://api.spotify.com/v1/me/player/play")
+
+    /**
+     * Pauses playback.
+     * Spotify API: PUT /v1/me/player/pause
+     */
+    suspend fun pause(): Boolean =
+        putPlayerCommand("https://api.spotify.com/v1/me/player/pause")
+
+    /**
+     * Returns true if Spotify is currently playing, false if paused, null if no active player.
+     * Spotify API: GET /v1/me/player
+     *
+     * C# equivalent: await _httpClient.GetFromJsonAsync<PlayerState>(".../player");
+     */
+    suspend fun isPlaying(): Boolean? = withContext(Dispatchers.IO) {
+        try {
+            val token = getToken() ?: return@withContext null
+
+            val request = Request.Builder()
+                .url("https://api.spotify.com/v1/me/player")
+                .get()
+                .addHeader("Authorization", "Bearer $token")
+                .build()
+
+            val response = httpClient.newCall(request).execute()
+
+            when (response.code) {
+                200 -> {
+                    val body = response.body?.string() ?: return@withContext false
+                    JSONObject(body).getBoolean("is_playing")
+                }
+                204 -> false  // No active player
+                401 -> { clearToken(); null }
+                else -> {
+                    println("isPlaying failed: ${response.code}")
+                    null
+                }
+            }
+        } catch (e: Exception) {
+            println("isPlaying error: ${e.message}")
+            null
+        }
+    }
+
+    // Shared helper for PUT commands that expect 204 No Content.
+    // ≈ private async Task<bool> PutPlayerCommand(string url)
+    private suspend fun putPlayerCommand(url: String): Boolean = withContext(Dispatchers.IO) {
         try {
             val token = getToken() ?: return@withContext false
 
             val request = Request.Builder()
-                .url("https://api.spotify.com/v1/me/player/seek?position_ms=$positionMs")
+                .url(url)
                 .put(ByteArray(0).toRequestBody(null))
                 .addHeader("Authorization", "Bearer $token")
                 .build()
 
             val response = httpClient.newCall(request).execute()
 
-            // 204 = success (No Content – Spotify returns an empty body)
-            // 401 = token expired → needs refresh
+            // 204 = success (No Content)
+            // 401 = token expired
             // 403 = not Premium
-            // 404 = no active device is playing
+            // 404 = no active device
             when (response.code) {
                 204 -> true
-                401 -> {
-                    // Token expired – delete it, user must log in again
-                    clearToken()
-                    false
-                }
+                401 -> { clearToken(); false }
                 else -> {
-                    // Log for debugging
-                    println("Spotify seek failed: ${response.code} ${response.body?.string()}")
+                    println("Player command failed: ${response.code} ${response.body?.string()}")
                     false
                 }
             }
         } catch (e: Exception) {
-            println("Seek error: ${e.message}")
+            println("Player command error: ${e.message}")
             false
         }
     }
