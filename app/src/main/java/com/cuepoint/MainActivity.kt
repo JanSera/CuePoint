@@ -13,6 +13,8 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.wear.compose.material.*
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Add
+import androidx.compose.material.icons.filled.Remove
 import androidx.compose.material.icons.filled.Replay
 import kotlinx.coroutines.launch
 
@@ -83,22 +85,24 @@ fun CuePointApp(spotifyApi: SpotifyApi) {
                 ) {
                     // Minutes: 0-9
                     InlineSlider(
-                        value = minutes.toFloat(),
-                        onValueChange = { minutes = it.toInt() },
-                        valueRange = 0f..9f,
-                        steps = 8,
-                        modifier = Modifier.width(60.dp)
+                        value = minutes,
+                        onValueChange = { minutes = it },
+                        valueProgression = 0..9,
+                        decreaseIcon = { Icon(Icons.Default.Remove, contentDescription = "Decrease") },
+                        increaseIcon = { Icon(Icons.Default.Add, contentDescription = "Increase") },
+                        modifier = Modifier.width(80.dp)
                     )
 
                     Text(":", fontSize = 24.sp, color = Color.White)
 
                     // Seconds: 0-59
                     InlineSlider(
-                        value = seconds.toFloat(),
-                        onValueChange = { seconds = it.toInt() },
-                        valueRange = 0f..59f,
-                        steps = 58,
-                        modifier = Modifier.width(60.dp)
+                        value = seconds,
+                        onValueChange = { seconds = it },
+                        valueProgression = 0..59,
+                        decreaseIcon = { Icon(Icons.Default.Remove, contentDescription = "Decrease") },
+                        increaseIcon = { Icon(Icons.Default.Add, contentDescription = "Increase") },
+                        modifier = Modifier.width(80.dp)
                     )
                 }
 

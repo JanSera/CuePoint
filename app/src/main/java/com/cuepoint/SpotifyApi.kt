@@ -11,6 +11,7 @@ import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.withContext
 import okhttp3.OkHttpClient
 import okhttp3.Request
+import okhttp3.RequestBody.Companion.toRequestBody
 
 /**
  * Spotify Web API client.
@@ -62,7 +63,7 @@ class SpotifyApi(private val context: Context) {
 
             val request = Request.Builder()
                 .url("https://api.spotify.com/v1/me/player/seek?position_ms=$positionMs")
-                .put(okhttp3.RequestBody.create(null, ByteArray(0)))
+                .put(ByteArray(0).toRequestBody(null))
                 .addHeader("Authorization", "Bearer $token")
                 .build()
 
