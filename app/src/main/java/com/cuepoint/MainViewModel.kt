@@ -23,7 +23,8 @@ data class CuePointUiState(
     val timeMs: Long = 73_000L,         // 1:13 default
     val isPlaying: Boolean = false,
     val isLoading: Boolean = false,
-    val errorMessage: String? = null
+    val errorMessage: String? = null,
+    val isLoggedIn: Boolean = false      // false until token check completes on init
 )
 
 // AndroidViewModel (not plain ViewModel) because we need Application context for haptics.
@@ -46,6 +47,18 @@ class MainViewModel(
 
     private var errorClearJob: Job? = null
 
+    init {
+        // Check for a stored token on startup — determines whether to show login screen
+        viewModelScope.launch {
+            _uiState.update { it.copy(isLoggedIn = spotifyApi.isLoggedIn()) }
+        }
+    }
+
+    // Called from MainActivity.onNewIntent() after a successful OAuth token exchange
+    fun onLoginComplete() {
+        _uiState.update { it.copy(isLoggedIn = true) }
+    }
+
     // --- Spotify actions ---
 
     fun togglePlayPause() {
@@ -58,7 +71,7 @@ class MainViewModel(
                 if (success) {
                     _uiState.update { it.copy(isPlaying = !wasPlaying) }
                 } else {
-                    showError("Playback failed")
+                    handleApiFailure("Playback failed")
                 }
             } catch (e: Exception) {
                 showError("Network error")
@@ -76,13 +89,13 @@ class MainViewModel(
                 // Pause before seeking to avoid a race condition where Spotify
                 // resumes mid-seek and ignores the position.
                 val pauseOk = spotifyApi.pause()
-                if (!pauseOk) { showError("Could not pause"); return@launch }
+                if (!pauseOk) { handleApiFailure("Could not pause"); return@launch }
 
                 val seekOk = spotifyApi.seek(_uiState.value.timeMs)
                 if (seekOk) {
                     _uiState.update { it.copy(isPlaying = false) }
                 } else {
-                    showError("Seek failed")
+                    handleApiFailure("Seek failed")
                 }
             } catch (e: Exception) {
                 showError("Network error")
@@ -105,6 +118,15 @@ class MainViewModel(
     }
 
     // --- Error handling ---
+
+    // Check if the failure was a 401 (token cleared by spotifyPut) — if so, go to login
+    private suspend fun handleApiFailure(fallbackMessage: String) {
+        if (!spotifyApi.isLoggedIn()) {
+            _uiState.update { it.copy(isLoggedIn = false, errorMessage = "Session expired") }
+        } else {
+            showError(fallbackMessage)
+        }
+    }
 
     private fun showError(message: String) {
         errorClearJob?.cancel()

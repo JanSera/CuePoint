@@ -33,6 +33,7 @@ class MainActivity : ComponentActivity() {
 
     private lateinit var spotifyApi: SpotifyApi
     private lateinit var spotifyAuth: SpotifyAuth
+    private var viewModel: MainViewModel? = null
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -43,7 +44,8 @@ class MainActivity : ComponentActivity() {
             val vm: MainViewModel = viewModel(
                 factory = MainViewModel.factory(application, spotifyApi)
             )
-            CuePointApp(vm)
+            viewModel = vm
+            CuePointApp(vm, onLogin = { spotifyAuth.openAuthInBrowser() })
         }
     }
 
@@ -55,6 +57,7 @@ class MainActivity : ComponentActivity() {
                 val token = spotifyAuth.handleCallback(uri)
                 if (token != null) {
                     spotifyApi.saveToken(token)
+                    viewModel?.onLoginComplete()
                 }
             }
         }
@@ -62,12 +65,55 @@ class MainActivity : ComponentActivity() {
 }
 
 @Composable
-fun CuePointApp(vm: MainViewModel) {
+fun CuePointApp(vm: MainViewModel, onLogin: () -> Unit) {
     val uiState by vm.uiState.collectAsState()
+
+    MaterialTheme {
+        if (!uiState.isLoggedIn) {
+            LoginScreen(onLogin = onLogin, errorMessage = uiState.errorMessage)
+        } else {
+            MainPager(vm, uiState)
+        }
+    }
+}
+
+@Composable
+fun LoginScreen(onLogin: () -> Unit, errorMessage: String?) {
+    Scaffold(timeText = { TimeText() }) {
+        Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+            Column(
+                horizontalAlignment = Alignment.CenterHorizontally,
+                verticalArrangement = Arrangement.spacedBy(12.dp)
+            ) {
+                Text(
+                    text = "CuePoint",
+                    fontSize = 20.sp,
+                    color = Color(0xFF1DB954)
+                )
+                Chip(
+                    onClick = onLogin,
+                    label = { Text("Login with Spotify") },
+                    colors = ChipDefaults.chipColors(backgroundColor = Color(0xFF1DB954))
+                )
+                errorMessage?.let {
+                    Text(
+                        text = it,
+                        fontSize = 11.sp,
+                        color = Color.Red,
+                        textAlign = TextAlign.Center,
+                        modifier = Modifier.padding(horizontal = 8.dp)
+                    )
+                }
+            }
+        }
+    }
+}
+
+@Composable
+fun MainPager(vm: MainViewModel, uiState: CuePointUiState) {
     val pagerState = rememberPagerState(pageCount = { 2 })
     val coroutineScope = rememberCoroutineScope()
 
-    // Keep screen on while on the Control page — important during a dance session
     val activity = LocalContext.current as Activity
     DisposableEffect(pagerState.currentPage) {
         if (pagerState.currentPage == 1)
@@ -79,32 +125,29 @@ fun CuePointApp(vm: MainViewModel) {
         }
     }
 
-    MaterialTheme {
-        Box(modifier = Modifier.fillMaxSize()) {
-            HorizontalPager(state = pagerState) { page ->
-                when (page) {
-                    0 -> SetupScreen(uiState, vm)
-                    1 -> ControlScreen(
-                        uiState = uiState,
-                        onPlayPause = vm::togglePlayPause,
-                        onReset = vm::resetToTime,
-                        onBack = { coroutineScope.launch { pagerState.animateScrollToPage(0) } }
-                    )
-                }
+    Box(modifier = Modifier.fillMaxSize()) {
+        HorizontalPager(state = pagerState) { page ->
+            when (page) {
+                0 -> SetupScreen(uiState, vm)
+                1 -> ControlScreen(
+                    uiState = uiState,
+                    onPlayPause = vm::togglePlayPause,
+                    onReset = vm::resetToTime,
+                    onBack = { coroutineScope.launch { pagerState.animateScrollToPage(0) } }
+                )
             }
-
-            // Page indicator dots at the bottom
-            HorizontalPageIndicator(
-                pageIndicatorState = object : PageIndicatorState {
-                    override val pageCount get() = 2
-                    override val pageOffset get() = pagerState.currentPageOffsetFraction
-                    override val selectedPage get() = pagerState.currentPage
-                },
-                modifier = Modifier
-                    .align(Alignment.BottomCenter)
-                    .padding(bottom = 6.dp)
-            )
         }
+
+        HorizontalPageIndicator(
+            pageIndicatorState = object : PageIndicatorState {
+                override val pageCount get() = 2
+                override val pageOffset get() = pagerState.currentPageOffsetFraction
+                override val selectedPage get() = pagerState.currentPage
+            },
+            modifier = Modifier
+                .align(Alignment.BottomCenter)
+                .padding(bottom = 6.dp)
+        )
     }
 }
 
@@ -165,7 +208,6 @@ fun ControlScreen(
     onReset: () -> Unit,
     onBack: () -> Unit
 ) {
-    // Intercept back gesture — go to Setup instead of exiting the app
     BackHandler(enabled = true) { onBack() }
 
     Scaffold(timeText = { TimeText() }) {
@@ -174,7 +216,6 @@ fun ControlScreen(
                 horizontalArrangement = Arrangement.spacedBy(16.dp),
                 verticalAlignment = Alignment.CenterVertically
             ) {
-                // Play / Pause
                 Button(
                     onClick = onPlayPause,
                     enabled = !uiState.isLoading,
@@ -188,7 +229,6 @@ fun ControlScreen(
                     )
                 }
 
-                // Reset (pause + seek to set time)
                 Button(
                     onClick = onReset,
                     enabled = !uiState.isLoading,
@@ -199,12 +239,10 @@ fun ControlScreen(
                 }
             }
 
-            // Loading overlay
             if (uiState.isLoading) {
                 CircularProgressIndicator(modifier = Modifier.size(80.dp), strokeWidth = 3.dp)
             }
 
-            // Error message — auto-clears after 3s
             uiState.errorMessage?.let { msg ->
                 Text(
                     text = msg,
