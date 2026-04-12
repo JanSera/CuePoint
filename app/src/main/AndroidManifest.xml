@@ -4,6 +4,9 @@
     <!-- Required for Spotify API calls -->
     <uses-permission android:name="android.permission.INTERNET" />
 
+    <!-- Required to redirect https:// URLs from the watch to the paired phone's browser -->
+    <uses-permission android:name="com.google.android.wearable.permission.URI_REDIRECT_TO_REMOTE" />
+
     <!-- Marks this as a Wear OS app (not a phone app) -->
     <uses-feature android:name="android.hardware.type.watch" />
 

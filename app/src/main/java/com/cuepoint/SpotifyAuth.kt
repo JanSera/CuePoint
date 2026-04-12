@@ -75,11 +75,15 @@ class SpotifyAuth(private val context: Context) {
             .appendQueryParameter("code_challenge", codeChallenge)
             .build()
 
-        // Open in browser (on phone)
-        val intent = Intent(Intent.ACTION_VIEW, authUri).apply {
-            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-        }
-        context.startActivity(intent)
+        // Open in browser on the paired phone.
+        // CATEGORY_BROWSABLE + FLAG_ACTIVITY_NEW_TASK are both required for Wear OS to
+        // route the intent through UriRedirectActivity to the phone's browser.
+        context.startActivity(
+            Intent(Intent.ACTION_VIEW, authUri).apply {
+                addCategory(Intent.CATEGORY_BROWSABLE)
+                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            }
+        )
     }
 
     /**
