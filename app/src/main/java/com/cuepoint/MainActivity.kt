@@ -1,8 +1,11 @@
 package com.cuepoint
 
+import android.content.Intent
 import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
+import androidx.lifecycle.lifecycleScope
+import kotlinx.coroutines.launch
 import androidx.compose.foundation.layout.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
@@ -18,27 +21,35 @@ import androidx.compose.material.icons.filled.Pause
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.Remove
 import androidx.compose.material.icons.filled.Replay
-import kotlinx.coroutines.launch
 
-/**
- * Main (and only) Activity of the app.
- *
- * For .NET developers:
- * - Activity ≈ Window/Page in WPF/MAUI
- * - Compose ≈ declarative UI like XAML, but directly in code
- * - remember {} ≈ @State property (holds UI state)
- * - LaunchedEffect ≈ OnAppearing + async
- * - coroutineScope.launch ≈ Task.Run()
- */
 class MainActivity : ComponentActivity() {
+
+    private lateinit var spotifyApi: SpotifyApi
+    private lateinit var spotifyAuth: SpotifyAuth
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-
-        val spotifyApi = SpotifyApi(this)
+        spotifyApi = SpotifyApi(this)
+        spotifyAuth = SpotifyAuth(this)
 
         setContent {
             CuePointApp(spotifyApi)
+        }
+    }
+
+    // Called when Spotify redirects back to cuepoint://callback after OAuth login.
+    // singleTop (AndroidManifest) ensures this Activity instance receives the intent
+    // rather than a new one being created.
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        val uri = intent.data ?: return
+        if (uri.scheme == "cuepoint" && uri.host == "callback") {
+            lifecycleScope.launch {
+                val token = spotifyAuth.handleCallback(uri)
+                if (token != null) {
+                    spotifyApi.saveToken(token)
+                }
+            }
         }
     }
 }

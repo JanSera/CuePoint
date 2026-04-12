@@ -48,28 +48,17 @@ class SpotifyApi(private val context: Context) {
 
     private val httpClient = OkHttpClient()
 
-    /**
-     * Seeks playback to the given position in milliseconds.
-     *
-     * Spotify API: PUT /v1/me/player/seek?position_ms={ms}
-     * Scope: user-modify-playback-state
-     */
+    /** Seeks playback to [positionMs] milliseconds. Scope: user-modify-playback-state */
     suspend fun seek(positionMs: Long): Boolean =
-        putPlayerCommand("https://api.spotify.com/v1/me/player/seek?position_ms=$positionMs")
+        spotifyPut("https://api.spotify.com/v1/me/player/seek?position_ms=$positionMs")
 
-    /**
-     * Resumes playback.
-     * Spotify API: PUT /v1/me/player/play
-     */
+    /** Resumes playback on the active device. Scope: user-modify-playback-state */
     suspend fun play(): Boolean =
-        putPlayerCommand("https://api.spotify.com/v1/me/player/play")
+        spotifyPut("https://api.spotify.com/v1/me/player/play")
 
-    /**
-     * Pauses playback.
-     * Spotify API: PUT /v1/me/player/pause
-     */
+    /** Pauses playback on the active device. Scope: user-modify-playback-state */
     suspend fun pause(): Boolean =
-        putPlayerCommand("https://api.spotify.com/v1/me/player/pause")
+        spotifyPut("https://api.spotify.com/v1/me/player/pause")
 
     /**
      * Returns true if Spotify is currently playing, false if paused, null if no active player.
@@ -107,9 +96,9 @@ class SpotifyApi(private val context: Context) {
         }
     }
 
-    // Shared helper for PUT commands that expect 204 No Content.
-    // ≈ private async Task<bool> PutPlayerCommand(string url)
-    private suspend fun putPlayerCommand(url: String): Boolean = withContext(Dispatchers.IO) {
+    // Shared PUT helper — all Spotify playback endpoints use the same pattern.
+    // Returns true on 200/204, clears token on 401, false otherwise.
+    private suspend fun spotifyPut(url: String): Boolean = withContext(Dispatchers.IO) {
         try {
             val token = getToken() ?: return@withContext false
 
@@ -121,20 +110,16 @@ class SpotifyApi(private val context: Context) {
 
             val response = httpClient.newCall(request).execute()
 
-            // 204 = success (No Content)
-            // 401 = token expired
-            // 403 = not Premium
-            // 404 = no active device
             when (response.code) {
-                204 -> true
+                200, 204 -> true
                 401 -> { clearToken(); false }
                 else -> {
-                    println("Player command failed: ${response.code} ${response.body?.string()}")
+                    println("Spotify API failed [${response.code}]: ${response.body?.string()}")
                     false
                 }
             }
         } catch (e: Exception) {
-            println("Player command error: ${e.message}")
+            println("Spotify API error: ${e.message}")
             false
         }
     }
@@ -146,38 +131,30 @@ class SpotifyApi(private val context: Context) {
      * Tries DataStore first, then falls back to TEST_TOKEN.
      */
     private suspend fun getToken(): String? {
-        // Try stored OAuth token
         val prefs = context.dataStore.data.first()
         val savedToken = prefs[TOKEN_KEY]
         if (!savedToken.isNullOrEmpty()) return savedToken
 
-        // Fallback to test token
         if (TEST_TOKEN.isNotEmpty()) return TEST_TOKEN
 
         return null
     }
 
-    /**
-     * Saves the access token after a successful OAuth login.
-     */
+    /** Saves the access token after a successful OAuth login. */
     suspend fun saveToken(token: String) {
         context.dataStore.edit { prefs ->
             prefs[TOKEN_KEY] = token
         }
     }
 
-    /**
-     * Deletes the token (on expiry or logout).
-     */
+    /** Deletes the token (on expiry or logout). */
     suspend fun clearToken() {
         context.dataStore.edit { prefs ->
             prefs.remove(TOKEN_KEY)
         }
     }
 
-    /**
-     * Checks whether the user is logged in.
-     */
+    /** Checks whether the user is logged in. */
     suspend fun isLoggedIn(): Boolean {
         return getToken() != null
     }

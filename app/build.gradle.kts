@@ -48,7 +48,4 @@ dependencies {
 
     // DataStore – token storage (≈ SecureStorage)
     implementation("androidx.datastore:datastore-preferences:1.0.0")
-
-    // OAuth via phone (Wear OS delegates login to the paired phone)
-    implementation("androidx.wear:wear-phone-interactions:1.0.1")
 }
