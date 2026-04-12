@@ -54,9 +54,10 @@ class MainActivity : ComponentActivity() {
         val uri = intent.data ?: return
         if (uri.scheme == "cuepoint" && uri.host == "callback") {
             lifecycleScope.launch {
-                val token = spotifyAuth.handleCallback(uri)
-                if (token != null) {
-                    spotifyApi.saveToken(token)
+                val result = spotifyAuth.handleCallback(uri)
+                if (result != null) {
+                    spotifyApi.saveToken(result.accessToken)
+                    result.refreshToken?.let { spotifyApi.saveRefreshToken(it) }
                     viewModel?.onLoginComplete()
                 }
             }

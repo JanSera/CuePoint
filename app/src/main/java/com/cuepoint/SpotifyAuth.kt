@@ -88,14 +88,13 @@ class SpotifyAuth(private val context: Context) {
      * Called from MainActivity.onNewIntent() when the redirect
      * cuepoint://callback?code=... arrives.
      *
-     * Returns the access token, or null on error.
+     * Returns a TokenPair (accessToken + refreshToken), or null on error.
      */
-    suspend fun handleCallback(callbackUri: Uri): String? = withContext(Dispatchers.IO) {
+    suspend fun handleCallback(callbackUri: Uri): TokenPair? = withContext(Dispatchers.IO) {
         val code = callbackUri.getQueryParameter("code") ?: return@withContext null
         val verifier = codeVerifier ?: return@withContext null
 
         try {
-            // Exchange code for token (≈ POST to token endpoint)
             val requestBody = FormBody.Builder()
                 .add("client_id", CLIENT_ID)
                 .add("grant_type", "authorization_code")
@@ -104,19 +103,18 @@ class SpotifyAuth(private val context: Context) {
                 .add("code_verifier", verifier)
                 .build()
 
-            val request = Request.Builder()
-                .url(TOKEN_URL)
-                .post(requestBody)
-                .build()
+            val response = httpClient.newCall(
+                Request.Builder().url(TOKEN_URL).post(requestBody).build()
+            ).execute()
 
-            val response = httpClient.newCall(request).execute()
             val body = response.body?.string() ?: return@withContext null
 
             if (response.isSuccessful) {
                 val json = JSONObject(body)
-                // access_token is valid for ~1 hour
-                // refresh_token can be used to renew it (implement later)
-                json.getString("access_token")
+                TokenPair(
+                    accessToken = json.getString("access_token"),
+                    refreshToken = json.optString("refresh_token").takeIf { it.isNotEmpty() }
+                )
             } else {
                 println("Token exchange failed: $body")
                 null
@@ -126,6 +124,8 @@ class SpotifyAuth(private val context: Context) {
             null
         }
     }
+
+    data class TokenPair(val accessToken: String, val refreshToken: String?)
 
     // === PKCE helper methods ===
 
