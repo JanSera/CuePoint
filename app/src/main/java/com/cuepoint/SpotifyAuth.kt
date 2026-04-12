@@ -32,10 +32,13 @@ import java.util.Base64
 class SpotifyAuth(private val context: Context) {
 
     companion object {
-        // =============================================================
-        // PASTE YOUR CLIENT ID from the Spotify Developer Dashboard HERE
-        // =============================================================
-        private const val CLIENT_ID = "YOUR_CLIENT_ID_HERE"
+        // Injected at build time from local.properties (never committed).
+        // Throws at startup if missing — add spotify.clientId to local.properties.
+        private val CLIENT_ID = BuildConfig.SPOTIFY_CLIENT_ID.also {
+            check(it.isNotEmpty()) {
+                "SPOTIFY_CLIENT_ID is not set. Add spotify.clientId=<your_id> to local.properties."
+            }
+        }
 
         private const val REDIRECT_URI = "cuepoint://callback"
         private const val AUTH_URL = "https://accounts.spotify.com/authorize"
