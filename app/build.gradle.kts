@@ -58,6 +58,9 @@ dependencies {
     // DataStore – token storage (≈ SecureStorage)
     implementation("androidx.datastore:datastore-preferences:1.0.0")
 
+    // Compose Foundation — needed for HorizontalPager (pager not in wear.compose.foundation 1.3.0)
+    implementation("androidx.compose.foundation:foundation:1.6.1")
+
     // ViewModel + StateFlow (≈ INotifyPropertyChanged + ObservableProperty<T>)
     implementation("androidx.lifecycle:lifecycle-viewmodel-compose:2.7.0")
     implementation("androidx.lifecycle:lifecycle-runtime-ktx:2.7.0")

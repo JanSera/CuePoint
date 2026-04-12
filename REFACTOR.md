@@ -393,7 +393,33 @@ import androidx.lifecycle.viewmodel.compose.viewModel
 
 ---
 
-## Step 5 — Replace InlineSlider with rotary crown input
+## Step 5 — Time Picker UI (DEFERRED — design TBD)
+
+**Status:** Skipped for now. InlineSlider remains in place.
+
+### Idea under consideration: Circular arc drag picker
+
+Instead of rotary crown input, replace InlineSlider with a native round-display picker:
+- Green arc drawn from 0 to current time position (like a progress ring)
+- Small draggable pointer dot on the arc
+- Current time (`M:SS`) displayed large in the center
+- **One full rotation = 1 minute** — arc controls seconds within the minute; large digit in center shows minutes, tappable to increment
+- Crown/bezel as secondary input for fine-tuning seconds
+- Fast drag = coarse jump (10s steps); slow drag = 1s steps
+
+**Open questions before implementing:**
+- Does one rotation = 1 minute feel right, or should the full 0–10:00 range fit one sweep?
+- Separate minutes control (center tap) or keep it all on the arc?
+- Crown as parallel input alongside drag, or arc-only?
+
+**Implementation notes when ready:**
+- Canvas-based composable with `pointerInput` for drag angle detection
+- Map touch angle (atan2 from center) to time delta
+- `setMinutes()` / `setSeconds()` on ViewModel already exist as entry points
+
+---
+
+## Step 5 (original) — Replace InlineSlider with rotary crown input
 
 **Files:** `MainViewModel.kt`, `MainActivity.kt`
 
