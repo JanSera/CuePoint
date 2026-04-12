@@ -25,3 +25,6 @@ captures/
 
 # macOS
 .DS_Store
+
+# Work in progress / planning docs
+.wip/
