@@ -45,7 +45,11 @@ class MainActivity : ComponentActivity() {
                 factory = MainViewModel.factory(application, spotifyApi)
             )
             viewModel = vm
-            CuePointApp(vm, onLogin = { spotifyAuth.openAuthInBrowser() })
+            CuePointApp(vm, onLogin = {
+                if (!spotifyAuth.openAuthInBrowser()) {
+                    vm.showError("No paired phone found")
+                }
+            })
         }
     }
 

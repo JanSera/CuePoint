@@ -60,7 +60,7 @@ class SpotifyAuth(private val context: Context) {
      * On Wear OS this is done via an intent – the system routes it
      * to the paired phone where a browser opens.
      */
-    fun openAuthInBrowser() {
+    fun openAuthInBrowser(): Boolean {
         // Generate PKCE pair
         codeVerifier = generateCodeVerifier()
         val codeChallenge = generateCodeChallenge(codeVerifier!!)
@@ -78,12 +78,19 @@ class SpotifyAuth(private val context: Context) {
         // Open in browser on the paired phone.
         // CATEGORY_BROWSABLE + FLAG_ACTIVITY_NEW_TASK are both required for Wear OS to
         // route the intent through UriRedirectActivity to the phone's browser.
-        context.startActivity(
-            Intent(Intent.ACTION_VIEW, authUri).apply {
-                addCategory(Intent.CATEGORY_BROWSABLE)
-                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-            }
-        )
+        // Returns false if no paired phone is available (e.g. emulator, unpaired watch).
+        return try {
+            context.startActivity(
+                Intent(Intent.ACTION_VIEW, authUri).apply {
+                    addCategory(Intent.CATEGORY_BROWSABLE)
+                    addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                }
+            )
+            true
+        } catch (e: SecurityException) {
+            println("Auth redirect failed — no paired phone? ${e.message}")
+            false
+        }
     }
 
     /**

@@ -128,7 +128,7 @@ class MainViewModel(
         }
     }
 
-    private fun showError(message: String) {
+    fun showError(message: String) {
         errorClearJob?.cancel()
         _uiState.update { it.copy(errorMessage = message) }
         errorClearJob = viewModelScope.launch {
