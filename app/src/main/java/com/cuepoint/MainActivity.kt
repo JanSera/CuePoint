@@ -16,6 +16,11 @@ import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.lifecycle.repeatOnLifecycle
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
+import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.semantics.selected
+import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.semantics.stateDescription
 import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.focusable
 import androidx.compose.foundation.layout.*
@@ -206,16 +211,16 @@ fun MainPager(vm: MainViewModel, uiState: CuePointUiState) {
             }
         }
 
-        HorizontalPageIndicator(
-            pageIndicatorState = object : PageIndicatorState {
+        // No modifier: the curved indicator positions itself at the bottom of the round screen; an
+        // align/padding modifier shifts its arc off-screen.
+        val indicatorState = remember(pagerState) {
+            object : PageIndicatorState {
                 override val pageCount get() = 2
                 override val pageOffset get() = pagerState.currentPageOffsetFraction
                 override val selectedPage get() = pagerState.currentPage
-            },
-            modifier = Modifier
-                .align(Alignment.BottomCenter)
-                .padding(bottom = 6.dp)
-        )
+            }
+        }
+        HorizontalPageIndicator(pageIndicatorState = indicatorState)
     }
 }
 
@@ -256,32 +261,36 @@ fun SegmentScreen(uiState: CuePointUiState, vm: MainViewModel, isCurrent: Boolea
             }
             .focusRequester(focusRequester)
             .focusable()
-            // No TimeText here: the round corners need the room. Bottom padding clears the page dots.
-            // Three 48dp touch rows + a 24dp Log out line must fit 192dp. Side padding of 32dp keeps the
-            // top row's MARK chip inside the circle's chord at that height.
-            .padding(top = 16.dp, bottom = 2.dp, start = 32.dp, end = 32.dp),
+            // No TimeText here: the round corners need the room. Content is centred vertically; the
+            // bottom padding keeps the block clear of the curved page dots. Widest rows (pills 118dp, controls 172dp) sit where
+            // the 192dp circle's chord is still wider than they are.
+            .padding(top = 14.dp, bottom = 2.dp),
         horizontalAlignment = Alignment.CenterHorizontally,
-        verticalArrangement = Arrangement.Top
+        verticalArrangement = Arrangement.Center
     ) {
-        SegmentRow(
-            label = "FROM",
-            value = formatMs(uiState.fromMs),
-            selected = uiState.selectedField == SegmentField.From,
-            onSelect = { vm.selectField(SegmentField.From) },
-            onLongClick = null,
-            onMark = { vm.mark(SegmentField.From) }
-        )
-        SegmentRow(
-            label = "TO",
-            value = uiState.toMs?.let(::formatMs) ?: "—",
-            selected = uiState.selectedField == SegmentField.To,
-            onSelect = { vm.selectField(SegmentField.To) },
-            onLongClick = vm::clearTo,   // long-press clears "to"
-            onMark = { vm.mark(SegmentField.To) }
-        )
+        // Two equal pills: tap selects the field for crown, +/- and MARK; long-press on TO clears it.
+        Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+            SegmentPill(
+                label = "FROM",
+                value = formatMs(uiState.fromMs),
+                selected = uiState.selectedField == SegmentField.From,
+                onSelect = { vm.selectField(SegmentField.From) },
+                onLongClick = null
+            )
+            SegmentPill(
+                label = "TO",
+                value = uiState.toMs?.let(::formatMs) ?: "—",
+                selected = uiState.selectedField == SegmentField.To,
+                onSelect = { vm.selectField(SegmentField.To) },
+                onLongClick = vm::clearTo
+            )
+        }
 
+        Spacer(Modifier.height(4.dp))
+
+        // One MARK for whichever field is selected, flanked by the 1 s nudges.
         Row(
-            horizontalArrangement = Arrangement.spacedBy(16.dp),
+            horizontalArrangement = Arrangement.spacedBy(6.dp),
             verticalAlignment = Alignment.CenterVertically
         ) {
             Button(
@@ -289,6 +298,17 @@ fun SegmentScreen(uiState: CuePointUiState, vm: MainViewModel, isCurrent: Boolea
                 modifier = Modifier.size(ButtonDefaults.SmallButtonSize),   // 48dp touch target
                 colors = ButtonDefaults.secondaryButtonColors()
             ) { Icon(Icons.Default.Remove, "Back 1 second", Modifier.size(20.dp)) }
+            CompactChip(
+                onClick = { vm.mark(uiState.selectedField) },
+                modifier = Modifier.width(64.dp),
+                label = {
+                    Text(
+                        "MARK", fontSize = 12.sp, maxLines = 1, textAlign = TextAlign.Center,
+                        modifier = Modifier.fillMaxWidth()
+                    )
+                },
+                colors = ChipDefaults.secondaryChipColors()
+            )
             Button(
                 onClick = { vm.nudge(1_000L) },
                 modifier = Modifier.size(ButtonDefaults.SmallButtonSize),
@@ -298,17 +318,17 @@ fun SegmentScreen(uiState: CuePointUiState, vm: MainViewModel, isCurrent: Boolea
 
         // The error line takes the Log out chip's place for its 3 s, so a MARK error is visible
         // without needing extra height (and Log out cannot be hit by accident meanwhile).
-        Box(modifier = Modifier.height(24.dp), contentAlignment = Alignment.Center) {
+        Box(modifier = Modifier.height(48.dp), contentAlignment = Alignment.Center) {
             val error = uiState.errorMessage
             if (error != null) {
                 Text(
                     text = error, fontSize = 10.sp, lineHeight = 11.sp, color = Color.Red,
-                    textAlign = TextAlign.Center, maxLines = 2
+                    textAlign = TextAlign.Center, maxLines = 2,
+                    modifier = Modifier.padding(horizontal = 40.dp)
                 )
             } else {
                 CompactChip(
                     onClick = vm::logout,
-                    modifier = Modifier.height(24.dp),
                     label = { Text("Log out", fontSize = 10.sp) },
                     colors = ChipDefaults.secondaryChipColors()
                 )
@@ -317,50 +337,47 @@ fun SegmentScreen(uiState: CuePointUiState, vm: MainViewModel, isCurrent: Boolea
     }
 }
 
-// One line: [FROM 1:13] [MARK]. Tapping the label/value area selects the field for crown and +/-.
-// Label stacked over the value keeps the area narrow, so the MARK chip stays inside the round screen.
+// Label small over a large value. Selected = green outline and text; the other pill is plain dark grey.
 @OptIn(ExperimentalFoundationApi::class)
 @Composable
-private fun SegmentRow(
+private fun SegmentPill(
     label: String,
     value: String,
     selected: Boolean,
     onSelect: () -> Unit,
-    onLongClick: (() -> Unit)?,
-    onMark: () -> Unit
+    onLongClick: (() -> Unit)?
 ) {
-    Row(
-        modifier = Modifier.fillMaxWidth(),
-        verticalAlignment = Alignment.CenterVertically,
-        horizontalArrangement = Arrangement.spacedBy(4.dp)
+    val green = Color(0xFF1DB954)
+    Column(
+        modifier = Modifier
+            .width(56.dp)
+            .height(52.dp)   // >= 48dp touch target
+            .clip(RoundedCornerShape(14.dp))
+            .background(if (selected) Color(0xFF1B3B2A) else Color(0xFF2A2A2A))
+            .border(2.dp, if (selected) green else Color.Transparent, RoundedCornerShape(14.dp))
+            .semantics {
+                this.selected = selected
+                if (value == "—") stateDescription = "not set"
+            }
+            .combinedClickable(
+                role = Role.Tab,
+                onClickLabel = "Select",
+                onLongClickLabel = if (onLongClick != null) "Clear" else null,
+                onClick = onSelect,
+                onLongClick = onLongClick
+            ),
+        horizontalAlignment = Alignment.CenterHorizontally,
+        verticalArrangement = Arrangement.Center
     ) {
-        Column(
-            modifier = Modifier
-                .weight(1f)
-                .heightIn(min = 48.dp)   // touch target
-                .clip(RoundedCornerShape(8.dp))
-                .background(if (selected) Color(0xFF1B3B2A) else Color.Transparent)
-                .combinedClickable(onClick = onSelect, onLongClick = onLongClick)
-                .padding(horizontal = 6.dp),
-            horizontalAlignment = Alignment.CenterHorizontally,
-            verticalArrangement = Arrangement.Center
-        ) {
-            Text(text = label, fontSize = 9.sp, color = Color.LightGray)
-            Text(
-                text = value,
-                fontSize = 18.sp,
-                color = if (selected) Color(0xFF1DB954) else Color.White,
-                maxLines = 1
-            )
-        }
-        CompactChip(
-            onClick = onMark,
-            label = { Text("MARK", fontSize = 10.sp) },
-            colors = ChipDefaults.secondaryChipColors()
+        Text(text = label, fontSize = 9.sp, color = Color.LightGray)
+        Text(
+            text = value,
+            fontSize = 18.sp,
+            color = if (selected) green else Color.White,
+            maxLines = 1
         )
     }
 }
-
 
 @Composable
 fun ControlScreen(
