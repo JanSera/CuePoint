@@ -26,6 +26,9 @@ The watch is strapped to an instructor's wrist during a dance session — UI mus
 # Build and run
 ./gradlew :app:installDebug
 
+# Log in on an emulator (no paired phone): installs tokens via the debug-only DebugTokenReceiver (src/debug)
+# powershell -ExecutionPolicy Bypass -File tools\Get-SpotifyToken.ps1   (see README "Testing on an emulator")
+
 # Lint
 ./gradlew lint
 ```
@@ -46,6 +49,7 @@ Single Activity, MVVM (one ViewModel exposing a `StateFlow<CuePointUiState>`), C
 | `LoopController.kt` | The auto-stop timer, plain Kotlin (client, clock `() -> Long`, scope and a listener are constructor parameters, so it runs on virtual time in tests). While armed: remaining > 7 s → delay 5 s + GET; > 3 s → delay until 2.5 s before "to" + GET; else delay `remaining - rttEstimate/2`, `pause()`, `seek(from)`, report fired. `rttEstimate` is a moving average of PUT round trips (starts at 400 ms). The ViewModel decides arming; the controller only decides when to fire; resync GETs go back through the ViewModel's normal sync path |
 | `SpotifyApi.kt` | `ApiResult<T>` (Ok/Unauthorized/NoActiveDevice/PremiumRequired/Network/Other), `PlaybackState`, the `SpotifyClient` interface (what the ViewModel depends on; fakeable) and its implementation `SpotifyApi`: seek, play, pause, `getPlaybackState()` (GET /v1/me/player; 204 gives `Ok(null)`; an ad or podcast with no track gives a state with null track fields), `PlaybackState.positionAt(now)` (local position extrapolation, used by the live position and MARK); token + refresh-token storage via DataStore; transparent refresh-and-retry on 401 |
 | `SpotifyAuth.kt` | OAuth 2.0 PKCE flow; opens browser on paired phone via `Intent.ACTION_VIEW`; persists the verifier and OAuth `state` in DataStore until the callback |
+| `DebugTokenReceiver.kt` (`src/debug`) | Debug-only broadcast receiver that saves tokens injected by `tools/Get-SpotifyToken.ps1` |
 
 The Spotify client ID is injected at build time from `local.properties` (`spotify.clientId=...`) into `BuildConfig.SPOTIFY_CLIENT_ID`.
 

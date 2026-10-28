@@ -50,3 +50,19 @@ app/
 For a quick test without OAuth: generate a temporary token in the Spotify Developer Console
 (Get Token → check `user-modify-playback-state` and `user-read-playback-state`).
 Paste it into `TEST_TOKEN` in `SpotifyApi.kt`. Don't commit it.
+
+## Testing on an emulator
+
+An emulator has no paired phone, so the in-app login can't run. Log in on your PC instead and
+inject the tokens (access + refresh) into the debug build:
+
+1. Spotify dashboard: add `http://127.0.0.1:8888/callback` as a Redirect URI.
+2. Install the debug build: `./gradlew installDebug`
+3. Run (Windows PowerShell 5.1):
+   ```
+   powershell -ExecutionPolicy Bypass -File tools\Get-SpotifyToken.ps1
+   ```
+
+The script opens the Spotify login, sends the tokens over adb to a debug-only receiver and
+restarts the app. Options: `-Serial <id>` (several devices), `-NoAdb` (print the adb command),
+`-ShowTokens`. The receiver exists only in debug builds.

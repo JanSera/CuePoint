@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <application>
+        <!-- Debug builds only: lets tools/Get-SpotifyToken.ps1 inject tokens over adb. -->
+        <receiver
+            android:name=".DebugTokenReceiver"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="com.cuepoint.DEBUG_SET_TOKEN" />
+            </intent-filter>
+        </receiver>
+    </application>
+</manifest>
