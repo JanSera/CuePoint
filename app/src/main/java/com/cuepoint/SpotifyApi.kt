@@ -85,6 +85,16 @@ data class PlaybackState(
 )
 
 /**
+ * Where the player is at [nowElapsedMs] (SystemClock.elapsedRealtime()), without asking Spotify:
+ * the sampled position plus the time since the sample while playing. Pure, so the UI ticker,
+ * MARK and the auto-stop loop all share it. Clamped to [0, duration] (duration unknown = no upper bound).
+ */
+fun PlaybackState.positionAt(nowElapsedMs: Long): Long {
+    val raw = if (isPlaying) progressMs + (nowElapsedMs - sampledAtElapsedMs) else progressMs
+    return clampToTrack(raw, durationMs)
+}
+
+/**
  * What the ViewModel needs from Spotify; SpotifyApi is the real implementation, tests can fake it.
  * C# analogue: ISpotifyClient. The token methods are included (rather than a second interface)
  * because the VM is the only consumer and splitting four methods out would be more ceremony than value.

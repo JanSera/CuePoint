@@ -4,6 +4,8 @@ import android.app.Application
 import android.content.Context
 import android.net.Uri
 import android.os.Build
+import android.os.SystemClock
+import android.util.Log
 import android.os.VibrationEffect
 import android.os.Vibrator
 import android.os.VibratorManager
@@ -23,9 +25,18 @@ import kotlinx.coroutines.launch
 // C# analogue: a three-value enum instead of a nullable bool.
 enum class AuthState { Unknown, LoggedIn, LoggedOut }
 
+// Which end of the segment the crown / bezel and the +/- buttons act on.
+enum class SegmentField { From, To }
+
+// MARK subtracts this from the extrapolated position: the finger lags the music by roughly this much.
+const val REACTION_OFFSET_MS = 300L
+
 // C# analogue: record with INotifyPropertyChanged backing
 data class CuePointUiState(
-    val timeMs: Long = 73_000L,         // 1:13 default
+    // The current track's segment (see SegmentStore.kt for the rules). No segment yet = 0:00 → no "to".
+    val fromMs: Long = 0L,
+    val toMs: Long? = null,
+    val selectedField: SegmentField = SegmentField.From,
     val isPlaying: Boolean = false,
     val playback: PlaybackState? = null,   // last synced snapshot; null = nothing loaded / not synced yet
     val isLoading: Boolean = false,
@@ -41,7 +52,8 @@ data class CuePointUiState(
 class MainViewModel(
     app: Application,
     private val spotifyApi: SpotifyClient,
-    private val spotifyAuth: SpotifyAuth   // must hold the Application context, not an Activity
+    private val spotifyAuth: SpotifyAuth,  // must hold the Application context, not an Activity
+    private val segmentStore: SegmentStore
 ) : AndroidViewModel(app) {
 
     private val _uiState = MutableStateFlow(CuePointUiState())
@@ -56,6 +68,11 @@ class MainViewModel(
     }
 
     private var errorClearJob: Job? = null
+
+    // Track whose segment is currently shown, and the key segment edits are saved under.
+    // Null until the first synced track. It is NOT reset by an ad/podcast (trackId null): the values
+    // stay in memory, unsaved, and the same song coming back needs no reload. Main thread only.
+    private var loadedTrackId: String? = null
 
     // True while a callback is being exchanged, so init does not resolve to LoggedOut meanwhile
     // (that would flash the login screen and invite a second tap). Main thread only.
@@ -138,25 +155,68 @@ class MainViewModel(
 
     // Pulls the real player state (button icon, track, device). Called on resume and after login,
     // so the UI is right even if someone used Spotify on the phone in the meantime.
-    fun syncPlayback() {
+    // silent = the background 10 s loop (see CuePointApp): state effects apply, error text is rate-limited.
+    fun syncPlayback(silent: Boolean = false) {
         viewModelScope.launch {
             try {
-                when (val result = spotifyApi.getPlaybackState()) {
-                    is ApiResult.Ok -> {
-                        val state = result.value
-                        _uiState.update { it.copy(playback = state, isPlaying = state?.isPlaying ?: false) }
+                syncPlaybackOnce(silent)
+            } catch (e: Exception) {
+                if (!silent || !lastSyncFailed) showError("No connection")
+                lastSyncFailed = true
+            }
+        }
+    }
+
+    // Set by any failed sync, cleared by the next success. The silent 10 s loop shows an error only
+    // on the success-to-failure edge, so a dead connection does not flash a message every 10 s.
+    private var lastSyncFailed = false
+
+    private enum class SyncOutcome { Failed, Unchanged, TrackChanged }
+
+    // One GET + state update; shared by syncPlayback() and resetToTime(). Shows its own error on failure.
+    private suspend fun syncPlaybackOnce(silent: Boolean = false): SyncOutcome {
+        when (val result = spotifyApi.getPlaybackState()) {
+            is ApiResult.Ok -> {
+                val state = result.value
+                // A different song: swap in its stored segment (or the empty default). A null
+                // trackId (ad, podcast, local file) or no player leaves the values alone.
+                val trackId = state?.trackId
+                val changed = state != null && trackId != null && trackId != loadedTrackId
+                // A failing store must not look like a network error: log it and fall back to the
+                // default segment. loadedTrackId still moves on, so edits are never saved under the old track.
+                val stored = if (changed) {
+                    try {
+                        segmentStore.load(trackId!!)
+                    } catch (e: Exception) {
+                        Log.w("MainViewModel", "Loading segment failed: ${e.message}")
+                        null
                     }
-                    else -> {
-                        // Only "no device" proves the snapshot is stale. On Network/Other keep the last
-                        // known state and just show the error.
-                        if (result == ApiResult.NoActiveDevice) {
-                            _uiState.update { it.copy(playback = null, isPlaying = false) }
-                        }
-                        handleApiFailure(result, "Could not read playback")
+                } else null
+                if (changed) loadedTrackId = trackId
+                _uiState.update {
+                    val synced = it.copy(playback = state, isPlaying = state?.isPlaying ?: false)
+                    if (!changed) synced else {
+                        // moveFrom re-validates the stored values against this track's duration.
+                        val from = stored?.fromMs ?: 0L
+                        val (f, t) = moveFrom(from, stored?.toMs, from, state!!.durationMs)
+                        synced.copy(fromMs = f, toMs = t)
                     }
                 }
-            } catch (e: Exception) {
-                showError("No connection")
+                lastSyncFailed = false
+                return if (changed) SyncOutcome.TrackChanged else SyncOutcome.Unchanged
+            }
+            else -> {
+                // Only "no device" proves the snapshot is stale. On Network/Other keep the last
+                // known state and just show the error.
+                if (result == ApiResult.NoActiveDevice) {
+                    _uiState.update { it.copy(playback = null, isPlaying = false) }
+                }
+                // Silent: state effects above/below still apply (Unauthorized logs out), only the text is skipped.
+                if (!silent || result == ApiResult.Unauthorized || !lastSyncFailed) {
+                    handleApiFailure(result, "Could not read playback")
+                }
+                lastSyncFailed = true
+                return SyncOutcome.Failed
             }
         }
     }
@@ -175,7 +235,19 @@ class MainViewModel(
                 val wasPlaying = _uiState.value.isPlaying
                 val result = if (wasPlaying) spotifyApi.pause() else spotifyApi.play()
                 if (result is ApiResult.Ok) {
-                    _uiState.update { it.copy(isPlaying = !wasPlaying) }
+                    // Re-anchor the local snapshot so the position stays right without another GET:
+                    // freeze/resume from where it is extrapolated to right now.
+                    // `now` is taken after the PUT returned, so the position overshoots by about
+                    // RTT/2; Phase 5's RTT estimate can correct it.
+                    val now = SystemClock.elapsedRealtime()
+                    _uiState.update {
+                        it.copy(
+                            isPlaying = !wasPlaying,
+                            playback = it.playback?.let { p ->
+                                p.copy(isPlaying = !wasPlaying, progressMs = p.positionAt(now), sampledAtElapsedMs = now)
+                            }
+                        )
+                    }
                 } else {
                     handleApiFailure(result, "Playback failed")
                 }
@@ -192,6 +264,18 @@ class MainViewModel(
             _uiState.update { it.copy(isLoading = true) }
             vibrate(30)
             try {
+                // The song may have changed on the phone since the last sync. Check first: seeking a
+                // new song to the old song's "from" would be wrong. On a change, load its segment
+                // and stop; the user taps Reset again with the right values showing.
+                when (syncPlaybackOnce()) {
+                    SyncOutcome.Failed -> return@launch
+                    SyncOutcome.TrackChanged -> {
+                        showError("New song — segment loaded")
+                        return@launch
+                    }
+                    SyncOutcome.Unchanged -> Unit
+                }
+
                 // Pause before seeking to avoid a race condition where Spotify
                 // resumes mid-seek and ignores the position. We still always pause even though
                 // isPlaying is synced now: pause is idempotent (an already-paused 403 counts as OK)
@@ -202,9 +286,17 @@ class MainViewModel(
                     return@launch
                 }
 
-                val seekResult = spotifyApi.seek(_uiState.value.timeMs)
+                val fromMs = _uiState.value.fromMs
+                val seekResult = spotifyApi.seek(fromMs)
                 if (seekResult is ApiResult.Ok) {
-                    _uiState.update { it.copy(isPlaying = false) }
+                    // We paused and seeked, so the position is known exactly: no GET needed.
+                    val now = SystemClock.elapsedRealtime()
+                    _uiState.update {
+                        it.copy(
+                            isPlaying = false,
+                            playback = it.playback?.copy(isPlaying = false, progressMs = fromMs, sampledAtElapsedMs = now)
+                        )
+                    }
                 } else {
                     handleApiFailure(seekResult, "Seek failed")
                 }
@@ -216,16 +308,77 @@ class MainViewModel(
         }
     }
 
-    // --- Time adjustment (used by InlineSlider in current UI; replaced by rotary in Step 5) ---
+    // --- Segment editing ---
+    // Every change ends in setField/clearTo so validation (SegmentStore.kt) and saving happen in one place.
 
-    fun setMinutes(m: Int) {
-        val s = (_uiState.value.timeMs % 60_000L) / 1_000L
-        _uiState.update { it.copy(timeMs = (m * 60_000L + s * 1_000L).coerceIn(0L, 600_000L)) }
+    fun selectField(field: SegmentField) {
+        _uiState.update { it.copy(selectedField = field) }
     }
 
-    fun setSeconds(s: Int) {
-        val m = _uiState.value.timeMs / 60_000L
-        _uiState.update { it.copy(timeMs = (m * 60_000L + s * 1_000L).coerceIn(0L, 600_000L)) }
+    // MARK: take the live position (extrapolated locally, no network round trip) minus the reaction offset.
+    fun mark(field: SegmentField) {
+        selectField(field)
+        val playback = _uiState.value.playback
+        if (playback == null) {
+            showError("Open Spotify on a device")
+            return
+        }
+        vibrate(30)
+        setField(field, playback.positionAt(SystemClock.elapsedRealtime()) - REACTION_OFFSET_MS)
+    }
+
+    // +/- and the crown: move the selected field by deltaMs.
+    fun nudge(deltaMs: Long) {
+        val s = _uiState.value
+        when (s.selectedField) {
+            SegmentField.From -> setField(SegmentField.From, s.fromMs + deltaMs)
+            SegmentField.To -> when {
+                s.toMs != null -> setField(SegmentField.To, s.toMs + deltaMs)
+                // "to" is unset: the first + creates the shortest valid segment, - has nothing to do.
+                deltaMs > 0 -> setField(SegmentField.To, s.fromMs + MIN_SEGMENT_MS)
+            }
+        }
+    }
+
+    fun clearTo() {
+        _uiState.update { it.copy(toMs = null) }
+        persistSegment()
+    }
+
+    private fun setField(field: SegmentField, ms: Long) {
+        val s = _uiState.value
+        val duration = s.playback?.durationMs ?: 0L
+        when (field) {
+            SegmentField.From -> {
+                val (from, to) = moveFrom(s.fromMs, s.toMs, ms, duration)
+                _uiState.update { it.copy(fromMs = from, toMs = to) }
+                if (s.toMs != null && to == null) showError("To cleared")   // the rule in SegmentStore.kt
+            }
+            SegmentField.To -> {
+                val to = moveTo(s.fromMs, ms, duration)
+                if (to == null) {
+                    showError("To must be after From")
+                    return
+                }
+                _uiState.update { it.copy(toMs = to) }
+            }
+        }
+        persistSegment()
+    }
+
+    // Saves after every change. No track id (ad, nothing synced yet) = nothing to key it under.
+    // Launches start in order and DataStore applies edits in call order, so the last change wins.
+    private fun persistSegment() {
+        val trackId = loadedTrackId ?: return
+        val s = _uiState.value
+        val segment = Segment(trackId, s.fromMs, s.toMs)
+        viewModelScope.launch {
+            try {
+                segmentStore.save(segment)
+            } catch (e: Exception) {
+                Log.w("MainViewModel", "Saving segment failed: ${e.message}")
+            }
+        }
     }
 
     // --- Error handling ---
@@ -262,11 +415,11 @@ class MainViewModel(
     // Factory needed because the constructor takes a non-Application parameter (spotifyApi).
     // C# analogue: typed factory registered with an IoC container.
     companion object {
-        fun factory(app: Application, spotifyApi: SpotifyClient, spotifyAuth: SpotifyAuth) =
+        fun factory(app: Application, spotifyApi: SpotifyClient, spotifyAuth: SpotifyAuth, segmentStore: SegmentStore) =
             object : ViewModelProvider.Factory {
                 override fun <T : ViewModel> create(modelClass: Class<T>): T {
                     @Suppress("UNCHECKED_CAST")
-                    return MainViewModel(app, spotifyApi, spotifyAuth) as T
+                    return MainViewModel(app, spotifyApi, spotifyAuth, segmentStore) as T
                 }
             }
     }
