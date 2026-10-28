@@ -1,6 +1,7 @@
 package com.cuepoint
 
 import android.content.Context
+import android.os.SystemClock
 import android.util.Log
 import androidx.datastore.core.DataStore
 import androidx.datastore.preferences.core.Preferences
@@ -45,7 +46,8 @@ internal val httpClient = OkHttpClient()
 // onCreate, and refreshes must stay serialised across all of them.
 private val refreshMutex = Mutex()
 
-private class RawResponse(val code: Int, val body: String)
+// sampledAtElapsedMs: midpoint of the request round trip (only filled in by send()).
+private class RawResponse(val code: Int, val body: String, val sampledAtElapsedMs: Long = 0L)
 
 // Only Rejected means the refresh token is dead and the user must log in again.
 private sealed interface RefreshResult {
@@ -55,10 +57,52 @@ private sealed interface RefreshResult {
     data object Failed : RefreshResult        // 5xx etc. — keep tokens
 }
 
-/** Outcome of a playback call. NETWORK is split out so the UI can say "Network error". */
-enum class CallResult { OK, FAILED, NETWORK }
+/**
+ * Outcome of a Spotify call. Each failure the UI words differently gets its own case.
+ * C# analogue: a hand-rolled Result<T> / discriminated union; `when` over it must be exhaustive.
+ */
+sealed interface ApiResult<out T> {
+    data class Ok<T>(val value: T) : ApiResult<T>
+    data object Unauthorized : ApiResult<Nothing>      // refresh failed or retry still 401: tokens cleared, go to login
+    data object NoActiveDevice : ApiResult<Nothing>    // 404
+    data object PremiumRequired : ApiResult<Nothing>   // 403 with PREMIUM_REQUIRED only; "Restriction violated" is Ok for play/pause, Other elsewhere
+    data object Network : ApiResult<Nothing>           // no connection
+    data class Other(val code: Int) : ApiResult<Nothing>
+}
 
-class SpotifyApi(private val context: Context) {
+/** What GET /v1/me/player says is happening right now. */
+data class PlaybackState(
+    val isPlaying: Boolean,
+    val progressMs: Long,
+    val durationMs: Long,
+    // Null track fields: the player is active but has no track (ad, some podcasts). is_playing is still valid.
+    val trackId: String?,
+    val trackName: String?,
+    val deviceName: String,
+    // SystemClock.elapsedRealtime() at the midpoint of the request's round trip. The position
+    // now is progressMs + (elapsedRealtime() - sampledAtElapsedMs) while playing.
+    val sampledAtElapsedMs: Long
+)
+
+/**
+ * What the ViewModel needs from Spotify; SpotifyApi is the real implementation, tests can fake it.
+ * C# analogue: ISpotifyClient. The token methods are included (rather than a second interface)
+ * because the VM is the only consumer and splitting four methods out would be more ceremony than value.
+ */
+interface SpotifyClient {
+    suspend fun play(): ApiResult<Unit>
+    suspend fun pause(): ApiResult<Unit>
+    suspend fun seek(positionMs: Long): ApiResult<Unit>
+    /** Ok(null) means no player at all (204 / empty body). An item-less state (ad, podcast) is Ok with null track fields. */
+    suspend fun getPlaybackState(): ApiResult<PlaybackState?>
+
+    suspend fun isLoggedIn(): Boolean
+    suspend fun clearTokens()
+    suspend fun saveToken(token: String)
+    suspend fun saveRefreshToken(token: String)
+}
+
+class SpotifyApi(private val context: Context) : SpotifyClient {
 
     companion object {
         private val TOKEN_KEY         = stringPreferencesKey("access_token")
@@ -80,12 +124,16 @@ class SpotifyApi(private val context: Context) {
     }
 
     /** Seeks playback to [positionMs] milliseconds. Scope: user-modify-playback-state */
-    suspend fun seek(positionMs: Long): CallResult =
+    override suspend fun seek(positionMs: Long): ApiResult<Unit> =
         put("https://api.spotify.com/v1/me/player/seek?position_ms=$positionMs")
 
     /** Resumes playback on the active device. Scope: user-modify-playback-state */
-    suspend fun play(): CallResult =
-        put("https://api.spotify.com/v1/me/player/play")
+    override suspend fun play(): ApiResult<Unit> {
+        val response = execute("https://api.spotify.com/v1/me/player/play", put = true)
+        // Playing an already-playing player is a 403 "Restriction violated"; the goal state ("playing") holds.
+        if (response.code == 403 && response.body.contains("Restriction violated")) return ApiResult.Ok(Unit)
+        return response.toUnitResult()
+    }
 
     /**
      * Pauses playback on the active device. Scope: user-modify-playback-state
@@ -93,35 +141,60 @@ class SpotifyApi(private val context: Context) {
      * Pausing an already-paused player returns 403 "Restriction violated" — the player is
      * already in the state we wanted, so that counts as success.
      */
-    suspend fun pause(): CallResult {
+    override suspend fun pause(): ApiResult<Unit> {
         val response = execute("https://api.spotify.com/v1/me/player/pause", put = true)
         // The message can mean other restrictions too, but the goal state ("not playing") holds either way.
-        if (response.code == 403 && response.body.contains("Restriction violated")) return CallResult.OK
-        return response.toCallResult()
+        if (response.code == 403 && response.body.contains("Restriction violated")) return ApiResult.Ok(Unit)
+        return response.toUnitResult()
     }
 
     /**
-     * Returns true if playing, false if paused, null if there is no active device or the call failed.
-     * Spotify API: GET /v1/me/player (204 = no active device)
+     * Spotify API: GET /v1/me/player. Scope: user-read-playback-state
+     * 204 (no active device) → Ok(null). A null item (ads, some podcasts) → Ok with null track fields.
      */
-    suspend fun isPlaying(): Boolean? {
+    override suspend fun getPlaybackState(): ApiResult<PlaybackState?> {
         val response = execute("https://api.spotify.com/v1/me/player", put = false)
-        if (response.code != 200) return null
+        if (response.code !in 200..299) return response.errorResult()
+        if (response.body.isBlank()) return ApiResult.Ok(null)   // 204, or a 202 with no body
         return try {
-            JSONObject(response.body).getBoolean("is_playing")
+            val json = JSONObject(response.body)
+            val item = json.optJSONObject("item")   // null for ads / some podcasts, but is_playing is still valid
+            // optString returns the literal "null" for a JSON null, so check isNull() first.
+            val id = if (item == null || item.isNull("id")) null else item.optString("id").ifEmpty { null }
+            val name = if (item == null || item.isNull("name")) null else item.optString("name")
+            val device = json.optJSONObject("device")
+            ApiResult.Ok(
+                PlaybackState(
+                    isPlaying = json.optBoolean("is_playing", false),
+                    progressMs = json.optLong("progress_ms", 0L),
+                    durationMs = item?.optLong("duration_ms", 0L) ?: 0L,
+                    trackId = id,
+                    trackName = if (id == null) null else name,
+                    deviceName = if (device == null || device.isNull("name")) "" else device.optString("name"),
+                    sampledAtElapsedMs = response.sampledAtElapsedMs
+                )
+            )
         } catch (e: Exception) {
-            Log.w(TAG, "isPlaying parse error: ${e.message}")
-            null
+            Log.w(TAG, "getPlaybackState parse error: ${e.message}")
+            ApiResult.Other(response.code)
         }
     }
 
-    private suspend fun put(url: String): CallResult = execute(url, put = true).toCallResult()
+    private suspend fun put(url: String): ApiResult<Unit> = execute(url, put = true).toUnitResult()
 
     // Any 2xx is success — Spotify's player endpoints can answer 200, 202 or 204.
-    private fun RawResponse.toCallResult(): CallResult = when {
-        code in 200..299 -> CallResult.OK
-        code == -1       -> CallResult.NETWORK
-        else             -> CallResult.FAILED
+    private fun RawResponse.toUnitResult(): ApiResult<Unit> =
+        if (code in 200..299) ApiResult.Ok(Unit) else errorResult()
+
+    // By the time execute() returns a 401 the refresh path has already run (and cleared tokens),
+    // so 401 here always means "go to login". The synthetic 503 for a failed refresh falls into Other.
+    private fun RawResponse.errorResult(): ApiResult<Nothing> = when (code) {
+        -1   -> ApiResult.Network
+        401  -> ApiResult.Unauthorized
+        // Only PREMIUM_REQUIRED means non-Premium; other 403s ("Restriction violated" on seek during an ad, ...) are Other.
+        403  -> if (body.contains("PREMIUM_REQUIRED")) ApiResult.PremiumRequired else ApiResult.Other(403)
+        404  -> ApiResult.NoActiveDevice
+        else -> ApiResult.Other(code)
     }
 
     // Shared request helper. On 401, refreshes the token and retries once. Tokens are cleared
@@ -151,13 +224,15 @@ class SpotifyApi(private val context: Context) {
     // response.use {} ≈ C# using — always releases the connection.
     private fun send(url: String, put: Boolean, token: String?): RawResponse {
         if (token == null) return RawResponse(401, "")
+        val sentAt = SystemClock.elapsedRealtime()
         return try {
             val builder = Request.Builder().url(url).addHeader("Authorization", "Bearer $token")
             if (put) builder.put(ByteArray(0).toRequestBody(null)) else builder.get()
             httpClient.newCall(builder.build()).execute().use { response ->
                 val body = response.body?.string() ?: ""
                 if (!response.isSuccessful) Log.w(TAG, "Spotify API failed [${response.code}]: $body")
-                RawResponse(response.code, body)
+                val receivedAt = SystemClock.elapsedRealtime()
+                RawResponse(response.code, body, sentAt + (receivedAt - sentAt) / 2)
             }
         } catch (e: Exception) {
             Log.w(TAG, "Spotify API error: ${e.message}")
@@ -237,16 +312,16 @@ class SpotifyApi(private val context: Context) {
         return context.dataStore.data.first()[REFRESH_TOKEN_KEY]?.takeIf { it.isNotEmpty() }
     }
 
-    suspend fun saveToken(token: String) {
+    override suspend fun saveToken(token: String) {
         context.dataStore.edit { it[TOKEN_KEY] = token }
     }
 
-    suspend fun saveRefreshToken(token: String) {
+    override suspend fun saveRefreshToken(token: String) {
         context.dataStore.edit { it[REFRESH_TOKEN_KEY] = token }
     }
 
     /** Clears both access and refresh tokens — call on logout or unrecoverable auth failure. */
-    suspend fun clearTokens() {
+    override suspend fun clearTokens() {
         context.dataStore.edit { prefs ->
             prefs.remove(TOKEN_KEY)
             prefs.remove(REFRESH_TOKEN_KEY)
@@ -254,5 +329,5 @@ class SpotifyApi(private val context: Context) {
     }
 
     /** Checks whether the user is logged in. */
-    suspend fun isLoggedIn(): Boolean = getToken() != null
+    override suspend fun isLoggedIn(): Boolean = getToken() != null
 }

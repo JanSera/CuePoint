@@ -59,6 +59,7 @@ dependencies {
     implementation("androidx.datastore:datastore-preferences:1.0.0")
 
     // ViewModel + StateFlow (≈ INotifyPropertyChanged + ObservableProperty<T>)
-    implementation("androidx.lifecycle:lifecycle-viewmodel-compose:2.7.0")
-    implementation("androidx.lifecycle:lifecycle-runtime-ktx:2.7.0")
+    implementation("androidx.lifecycle:lifecycle-viewmodel-compose:2.9.0")
+    implementation("androidx.lifecycle:lifecycle-runtime-ktx:2.9.0")
+    implementation("androidx.lifecycle:lifecycle-runtime-compose:2.9.0")   // LifecycleEventEffect
 }

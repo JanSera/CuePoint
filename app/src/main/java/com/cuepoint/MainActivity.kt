@@ -8,6 +8,8 @@ import androidx.activity.ComponentActivity
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.setContent
 import androidx.activity.viewModels
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.compose.LifecycleEventEffect
 import androidx.compose.foundation.layout.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
@@ -15,6 +17,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.wear.compose.foundation.pager.HorizontalPager
@@ -74,6 +77,10 @@ class MainActivity : ComponentActivity() {
 @Composable
 fun CuePointApp(vm: MainViewModel) {
     val uiState by vm.uiState.collectAsState()
+
+    // Re-read the real player state whenever the app comes back to the foreground. Lives here
+    // (not in MainPager) so it is registered before login finishes; the VM ignores it unless logged in.
+    LifecycleEventEffect(Lifecycle.Event.ON_RESUME) { vm.onResume() }
 
     MaterialTheme {
         when (uiState.authState) {
@@ -232,6 +239,24 @@ fun ControlScreen(
 
     Scaffold(timeText = { TimeText() }) {
         Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+            Column(horizontalAlignment = Alignment.CenterHorizontally) {
+            uiState.playback?.let { p ->
+                // One ellipsized line just above the buttons ("Track · Device", or just the device
+                // when an ad/podcast has no track). Narrow side padding because the round bezel clips corners.
+                val line = listOfNotNull(p.trackName, p.deviceName.ifEmpty { null }).joinToString(" · ")
+                if (line.isNotEmpty()) {
+                    Text(
+                        text = line,
+                        fontSize = 11.sp,
+                        color = Color.LightGray,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                        textAlign = TextAlign.Center,
+                        modifier = Modifier.padding(horizontal = 32.dp, vertical = 4.dp)
+                    )
+                }
+            }
+
             Row(
                 horizontalArrangement = Arrangement.spacedBy(16.dp),
                 verticalAlignment = Alignment.CenterVertically
@@ -257,6 +282,7 @@ fun ControlScreen(
                 ) {
                     Icon(Icons.Default.Replay, "Reset", Modifier.size(32.dp))
                 }
+            }
             }
 
             if (uiState.isLoading) {

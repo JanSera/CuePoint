@@ -27,6 +27,7 @@ enum class AuthState { Unknown, LoggedIn, LoggedOut }
 data class CuePointUiState(
     val timeMs: Long = 73_000L,         // 1:13 default
     val isPlaying: Boolean = false,
+    val playback: PlaybackState? = null,   // last synced snapshot; null = nothing loaded / not synced yet
     val isLoading: Boolean = false,
     val errorMessage: String? = null,
     val authState: AuthState = AuthState.Unknown,
@@ -39,7 +40,7 @@ data class CuePointUiState(
 // C# analogue: ViewModel : INotifyPropertyChanged with ObservableProperty<T> fields
 class MainViewModel(
     app: Application,
-    private val spotifyApi: SpotifyApi,
+    private val spotifyApi: SpotifyClient,
     private val spotifyAuth: SpotifyAuth   // must hold the Application context, not an Activity
 ) : AndroidViewModel(app) {
 
@@ -70,6 +71,8 @@ class MainViewModel(
                 if (it.authState != AuthState.Unknown) it
                 else it.copy(authState = if (loggedIn) AuthState.LoggedIn else AuthState.LoggedOut)
             }
+            // The first ON_RESUME fired while Unknown (skipped), so sync here for the cold start.
+            if (_uiState.value.authState == AuthState.LoggedIn) syncPlayback()
         }
     }
 
@@ -105,6 +108,7 @@ class MainViewModel(
                 spotifyApi.saveToken(result.tokens.accessToken)
                 result.tokens.refreshToken?.let { spotifyApi.saveRefreshToken(it) }
                 _uiState.update { it.copy(authState = AuthState.LoggedIn, loginError = null) }
+                syncPlayback()   // ON_RESUME fired on the redirect, before the exchange finished (still LoggedOut), so sync explicitly
             }
             SpotifyAuth.AuthResult.Cancelled -> failLogin("Login cancelled")
             SpotifyAuth.AuthResult.Failed -> failLogin("Login failed")
@@ -117,6 +121,7 @@ class MainViewModel(
     private suspend fun failLogin(message: String) {
         if (spotifyApi.isLoggedIn()) {
             _uiState.update { it.copy(authState = AuthState.LoggedIn) }   // stray callback: keep session, no error
+            syncPlayback()
         } else {
             _uiState.update { it.copy(authState = AuthState.LoggedOut, loginError = message) }
         }
@@ -131,20 +136,51 @@ class MainViewModel(
 
     // --- Spotify actions ---
 
+    // Pulls the real player state (button icon, track, device). Called on resume and after login,
+    // so the UI is right even if someone used Spotify on the phone in the meantime.
+    fun syncPlayback() {
+        viewModelScope.launch {
+            try {
+                when (val result = spotifyApi.getPlaybackState()) {
+                    is ApiResult.Ok -> {
+                        val state = result.value
+                        _uiState.update { it.copy(playback = state, isPlaying = state?.isPlaying ?: false) }
+                    }
+                    else -> {
+                        // Only "no device" proves the snapshot is stale. On Network/Other keep the last
+                        // known state and just show the error.
+                        if (result == ApiResult.NoActiveDevice) {
+                            _uiState.update { it.copy(playback = null, isPlaying = false) }
+                        }
+                        handleApiFailure(result, "Could not read playback")
+                    }
+                }
+            } catch (e: Exception) {
+                showError("No connection")
+            }
+        }
+    }
+
+    // ON_RESUME hook. LoggedIn only: before that there is no token, and init/login sync themselves.
+    fun onResume() {
+        if (_uiState.value.authState == AuthState.LoggedIn) syncPlayback()
+    }
+
     fun togglePlayPause() {
         viewModelScope.launch {
             _uiState.update { it.copy(isLoading = true) }
             vibrate(30)
             try {
+                // isPlaying is kept in sync with Spotify (see syncPlayback), so it is a reliable toggle basis.
                 val wasPlaying = _uiState.value.isPlaying
                 val result = if (wasPlaying) spotifyApi.pause() else spotifyApi.play()
-                if (result == CallResult.OK) {
+                if (result is ApiResult.Ok) {
                     _uiState.update { it.copy(isPlaying = !wasPlaying) }
                 } else {
                     handleApiFailure(result, "Playback failed")
                 }
             } catch (e: Exception) {
-                showError("Network error")
+                showError("No connection")
             } finally {
                 _uiState.update { it.copy(isLoading = false) }
             }
@@ -157,23 +193,23 @@ class MainViewModel(
             vibrate(30)
             try {
                 // Pause before seeking to avoid a race condition where Spotify
-                // resumes mid-seek and ignores the position. Always pause: isPlaying isn't
-                // synced with Spotify yet (Phase 3) so it can be stale, and pause is idempotent
-                // (an already-paused 403 counts as OK). Skipping it can return once state is synced.
+                // resumes mid-seek and ignores the position. We still always pause even though
+                // isPlaying is synced now: pause is idempotent (an already-paused 403 counts as OK)
+                // and cheap, and it covers state that changed since the last sync.
                 val pauseResult = spotifyApi.pause()
-                if (pauseResult != CallResult.OK) {
+                if (pauseResult !is ApiResult.Ok) {
                     handleApiFailure(pauseResult, "Could not pause")
                     return@launch
                 }
 
                 val seekResult = spotifyApi.seek(_uiState.value.timeMs)
-                if (seekResult == CallResult.OK) {
+                if (seekResult is ApiResult.Ok) {
                     _uiState.update { it.copy(isPlaying = false) }
                 } else {
                     handleApiFailure(seekResult, "Seek failed")
                 }
             } catch (e: Exception) {
-                showError("Network error")
+                showError("No connection")
             } finally {
                 _uiState.update { it.copy(isLoading = false) }
             }
@@ -194,15 +230,17 @@ class MainViewModel(
 
     // --- Error handling ---
 
-    // Network errors get their own message; otherwise, if the tokens were cleared
-    // (refresh + retry both got 401), go to login.
-    private suspend fun handleApiFailure(result: CallResult, fallbackMessage: String) {
-        if (result == CallResult.NETWORK) {
-            showError("Network error")
-        } else if (!spotifyApi.isLoggedIn()) {
-            _uiState.update { it.copy(authState = AuthState.LoggedOut, loginError = "Session expired") }
-        } else {
-            showError(fallbackMessage)
+    // One line per failure kind. Unauthorized means the client already cleared the tokens,
+    // so go to login; Other gets the caller's action-specific text.
+    private fun handleApiFailure(result: ApiResult<*>, fallbackMessage: String) {
+        when (result) {
+            is ApiResult.Ok -> Unit   // not a failure
+            ApiResult.Unauthorized ->
+                _uiState.update { it.copy(authState = AuthState.LoggedOut, loginError = "Session expired") }
+            ApiResult.NoActiveDevice -> showError("Open Spotify on a device")
+            ApiResult.PremiumRequired -> showError("Spotify Premium required")
+            ApiResult.Network -> showError("No connection")
+            is ApiResult.Other -> showError(fallbackMessage)
         }
     }
 
@@ -224,7 +262,7 @@ class MainViewModel(
     // Factory needed because the constructor takes a non-Application parameter (spotifyApi).
     // C# analogue: typed factory registered with an IoC container.
     companion object {
-        fun factory(app: Application, spotifyApi: SpotifyApi, spotifyAuth: SpotifyAuth) =
+        fun factory(app: Application, spotifyApi: SpotifyClient, spotifyAuth: SpotifyAuth) =
             object : ViewModelProvider.Factory {
                 override fun <T : ViewModel> create(modelClass: Class<T>): T {
                     @Suppress("UNCHECKED_CAST")
