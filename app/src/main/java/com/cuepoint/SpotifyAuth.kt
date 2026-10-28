@@ -1,10 +1,14 @@
 package com.cuepoint
 
+import android.content.ActivityNotFoundException
 import android.content.Context
 import android.content.Intent
 import android.net.Uri
 import android.util.Log
+import androidx.datastore.preferences.core.edit
+import androidx.datastore.preferences.core.stringPreferencesKey
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.withContext
 import okhttp3.FormBody
 import okhttp3.Request
@@ -29,7 +33,14 @@ private const val TAG = "SpotifyAuth"
  *
  * FLOW:
  *   Watch → openAuthInBrowser() → Phone browser → Spotify login
- *   → Redirect to cuepoint://callback?code=XYZ → handleCallback() → Token saved
+ *   → Redirect to cuepoint://callback?code=XYZ&state=ABC → MainActivity forwards the Uri
+ *   → MainViewModel.handleAuthCallback() → handleCallback() → Token saved
+ *
+ * The verifier and the OAuth `state` are persisted in DataStore (not kept in a field) because
+ * the app process can be killed while the user is logging in on the phone.
+ *
+ * [context] must be the Application context: this object lives as long as the ViewModel,
+ * so holding an Activity here would leak it.
  */
 class SpotifyAuth(private val context: Context) {
 
@@ -48,11 +59,18 @@ class SpotifyAuth(private val context: Context) {
 
         // Scope = permissions. We only need playback control.
         private const val SCOPE = "user-modify-playback-state user-read-playback-state"
+
+        // Pending-login values, stored between opening the browser and the callback.
+        private val VERIFIER_KEY = stringPreferencesKey("pending_code_verifier")
+        private val STATE_KEY    = stringPreferencesKey("pending_oauth_state")
     }
 
-    // The code verifier must be kept between the authorize call and the callback.
-    // In production you'd store it in DataStore; kept in memory here for simplicity.
-    private var codeVerifier: String? = null
+    /** Outcome of the redirect. Cancelled = the user denied access on the consent page. */
+    sealed interface AuthResult {
+        data class Success(val tokens: TokenPair) : AuthResult
+        data object Cancelled : AuthResult
+        data object Failed : AuthResult
+    }
 
     /**
      * Step 1: Open the Spotify login in a browser on the paired phone.
@@ -60,10 +78,16 @@ class SpotifyAuth(private val context: Context) {
      * On Wear OS this is done via an intent – the system routes it
      * to the paired phone where a browser opens.
      */
-    fun openAuthInBrowser(): Boolean {
-        // Generate PKCE pair
-        codeVerifier = generateCodeVerifier()
-        val codeChallenge = generateCodeChallenge(codeVerifier!!)
+    suspend fun openAuthInBrowser(): Boolean {
+        // Generate the PKCE pair plus a random `state`. Spotify echoes `state` back on the
+        // redirect; if it doesn't match, the callback isn't from the login we started (CSRF defence).
+        val verifier = generateCodeVerifier()
+        val codeChallenge = generateCodeChallenge(verifier)
+        val state = generateCodeVerifier()
+        context.dataStore.edit {
+            it[VERIFIER_KEY] = verifier
+            it[STATE_KEY] = state
+        }
 
         // Build the authorize URL
         val authUri = Uri.parse(AUTH_URL).buildUpon()
@@ -73,11 +97,13 @@ class SpotifyAuth(private val context: Context) {
             .appendQueryParameter("scope", SCOPE)
             .appendQueryParameter("code_challenge_method", "S256")
             .appendQueryParameter("code_challenge", codeChallenge)
+            .appendQueryParameter("state", state)
             .build()
 
         // Open in browser on the paired phone.
         // CATEGORY_BROWSABLE + FLAG_ACTIVITY_NEW_TASK are both required for Wear OS to
         // route the intent through UriRedirectActivity to the phone's browser.
+        // (NEW_TASK is also what allows starting an activity from the Application context.)
         // Returns false if no paired phone is available (e.g. emulator, unpaired watch).
         return try {
             context.startActivity(
@@ -89,6 +115,11 @@ class SpotifyAuth(private val context: Context) {
             true
         } catch (e: SecurityException) {
             Log.w(TAG, "Auth redirect failed — no paired phone? ${e.message}")
+            clearPending()
+            false
+        } catch (e: ActivityNotFoundException) {
+            Log.w(TAG, "Auth redirect failed — nothing can open the URL: ${e.message}")
+            clearPending()
             false
         }
     }
@@ -96,52 +127,89 @@ class SpotifyAuth(private val context: Context) {
     /**
      * Step 2: Handle the callback after login.
      *
-     * Called from MainActivity.onNewIntent() when the redirect
-     * cuepoint://callback?code=... arrives.
-     *
-     * Returns a TokenPair (accessToken + refreshToken), or null on error.
+     * Called (via the ViewModel) when the redirect
+     * cuepoint://callback?code=...&state=... (or ?error=...) arrives.
      */
-    suspend fun handleCallback(callbackUri: Uri): TokenPair? = withContext(Dispatchers.IO) {
-        val code = callbackUri.getQueryParameter("code") ?: return@withContext null
-        val verifier = codeVerifier ?: return@withContext null
+    suspend fun handleCallback(callbackUri: Uri): AuthResult {
+        val prefs = context.dataStore.data.first()
+        val verifier = prefs[VERIFIER_KEY]
+        val expectedState = prefs[STATE_KEY]
+        // A callback whose state does not match is foreign (another app, a stale link): reject it
+        // but keep the pending values, or it would wipe the verifier of a login still in progress.
+        val callbackState = callbackUri.getQueryParameter("state")
+        if (callbackState != null && callbackState != expectedState) {
+            Log.w(TAG, "Callback rejected: state mismatch")
+            return AuthResult.Failed
+        }
+        // Single use for every other outcome: clear before the exchange so every outcome (success, failure, cancel)
+        // leaves nothing behind. The values are already in memory, and an authorization code
+        // can only be redeemed once anyway, so there is nothing to retry.
+        clearPending()
 
-        try {
-            val requestBody = FormBody.Builder()
-                .add("client_id", CLIENT_ID)
-                .add("grant_type", "authorization_code")
-                .add("code", code)
-                .add("redirect_uri", REDIRECT_URI)
-                .add("code_verifier", verifier)
-                .build()
+        callbackUri.getQueryParameter("error")?.let { error ->
+            Log.w(TAG, "Authorization error: $error")
+            return if (error == "access_denied") AuthResult.Cancelled else AuthResult.Failed
+        }
 
-            httpClient.newCall(
-                Request.Builder().url(TOKEN_URL).post(requestBody).build()
-            ).execute().use { response ->
-                val body = response.body?.string() ?: return@withContext null
+        if (verifier == null || expectedState == null ||
+            callbackState != expectedState
+        ) {
+            Log.w(TAG, "Callback rejected: missing verifier or state")
+            return AuthResult.Failed
+        }
+        val code = callbackUri.getQueryParameter("code") ?: return AuthResult.Failed
 
-                if (response.isSuccessful) {
-                    val json = JSONObject(body)
-                    TokenPair(
-                        accessToken = json.getString("access_token"),
-                        refreshToken = json.optString("refresh_token").takeIf { it.isNotEmpty() }
-                    )
-                } else {
-                    Log.w(TAG, "Token exchange failed: $body")
-                    null
-                }
-            }
-        } catch (e: Exception) {
-            Log.w(TAG, "Auth error: ${e.message}")
-            null
+        return exchangeCode(code, verifier)?.let { AuthResult.Success(it) } ?: AuthResult.Failed
+    }
+
+    private suspend fun clearPending() {
+        context.dataStore.edit {
+            it.remove(VERIFIER_KEY)
+            it.remove(STATE_KEY)
         }
     }
+
+    // POSTs the authorization code + verifier to the token endpoint. Null on any failure.
+    private suspend fun exchangeCode(code: String, verifier: String): TokenPair? =
+        withContext(Dispatchers.IO) {
+            try {
+                val requestBody = FormBody.Builder()
+                    .add("client_id", CLIENT_ID)
+                    .add("grant_type", "authorization_code")
+                    .add("code", code)
+                    .add("redirect_uri", REDIRECT_URI)
+                    .add("code_verifier", verifier)
+                    .build()
+
+                httpClient.newCall(
+                    Request.Builder().url(TOKEN_URL).post(requestBody).build()
+                ).execute().use { response ->
+                    val body = response.body?.string() ?: return@withContext null
+
+                    if (response.isSuccessful) {
+                        val json = JSONObject(body)
+                        TokenPair(
+                            accessToken = json.getString("access_token"),
+                            refreshToken = json.optString("refresh_token").takeIf { it.isNotEmpty() }
+                        )
+                    } else {
+                        Log.w(TAG, "Token exchange failed: $body")
+                        null
+                    }
+                }
+            } catch (e: Exception) {
+                Log.w(TAG, "Auth error: ${e.message}")
+                null
+            }
+        }
 
     data class TokenPair(val accessToken: String, val refreshToken: String?)
 
     // === PKCE helper methods ===
 
     /**
-     * Generates a random code_verifier (43-128 chars, URL-safe).
+     * Generates a random URL-safe string (43 chars). Used for the code_verifier (43-128 allowed)
+     * and, reused, for the OAuth `state`.
      * ≈ RandomNumberGenerator.GetBytes() in C#
      */
     private fun generateCodeVerifier(): String {

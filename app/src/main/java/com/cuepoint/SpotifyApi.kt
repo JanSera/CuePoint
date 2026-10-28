@@ -30,7 +30,9 @@ import java.io.IOException
  */
 
 // Extension on Context to expose DataStore (singleton, similar to DI registration)
-private val Context.dataStore: DataStore<Preferences>
+// internal: SpotifyAuth keeps its pending-login values in the same file. A second
+// preferencesDataStore with the same name would crash.
+internal val Context.dataStore: DataStore<Preferences>
         by preferencesDataStore(name = "spotify_prefs")
 
 private const val TAG = "SpotifyApi"
@@ -225,7 +227,9 @@ class SpotifyApi(private val context: Context) {
         val prefs = context.dataStore.data.first()
         val savedToken = prefs[TOKEN_KEY]
         if (!savedToken.isNullOrEmpty()) return savedToken
-        if (TEST_TOKEN.isNotEmpty()) return TEST_TOKEN
+        // Debug builds only. Note: logging out with a TEST_TOKEN set just logs you back in on
+        // the next start, because this fallback still finds the token. Acceptable for testing.
+        if (BuildConfig.DEBUG && TEST_TOKEN.isNotEmpty()) return TEST_TOKEN
         return null
     }
 

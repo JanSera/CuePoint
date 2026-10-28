@@ -7,6 +7,7 @@ import android.view.WindowManager
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.setContent
+import androidx.activity.viewModels
 import androidx.compose.foundation.layout.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
@@ -16,8 +17,6 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import androidx.lifecycle.lifecycleScope
-import androidx.lifecycle.viewmodel.compose.viewModel
 import androidx.wear.compose.foundation.pager.HorizontalPager
 import androidx.wear.compose.foundation.pager.rememberPagerState
 import androidx.wear.compose.material.*
@@ -31,59 +30,66 @@ import kotlinx.coroutines.launch
 
 class MainActivity : ComponentActivity() {
 
-    private lateinit var spotifyApi: SpotifyApi
-    private lateinit var spotifyAuth: SpotifyAuth
-    private var viewModel: MainViewModel? = null
+    // Application context everywhere: the ViewModel outlives the Activity (rotation), so it
+    // must never hold a reference to it. The factory only runs when no VM exists yet.
+    // C# analogue: resolving a scoped service from the container.
+    private val viewModel: MainViewModel by viewModels {
+        MainViewModel.factory(
+            application,
+            SpotifyApi(applicationContext),
+            SpotifyAuth(applicationContext)
+        )
+    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        spotifyApi = SpotifyApi(this)
-        spotifyAuth = SpotifyAuth(this)
+
+        // Cold start: if the process was killed during login, Android relaunches us with the
+        // callback Uri in the launch intent and onNewIntent is never called. Only on a fresh
+        // launch: after a rotation/restore the same intent is still attached and the callback
+        // was already handled.
+        if (savedInstanceState == null) handleAuthIntent(intent)
 
         setContent {
-            val vm: MainViewModel = viewModel(
-                factory = MainViewModel.factory(application, spotifyApi)
-            )
-            viewModel = vm
-            CuePointApp(vm, onLogin = {
-                if (!spotifyAuth.openAuthInBrowser()) {
-                    vm.showError("No paired phone found")
-                }
-            })
+            CuePointApp(viewModel)
         }
     }
 
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
+        handleAuthIntent(intent)
+    }
+
+    // The Activity only forwards the Uri; the ViewModel does the work.
+    private fun handleAuthIntent(intent: Intent) {
         val uri = intent.data ?: return
+        // Recents relaunch re-delivers the old callback Uri; it was already handled.
+        if (intent.flags and Intent.FLAG_ACTIVITY_LAUNCHED_FROM_HISTORY != 0) return
         if (uri.scheme == "cuepoint" && uri.host == "callback") {
-            lifecycleScope.launch {
-                val result = spotifyAuth.handleCallback(uri)
-                if (result != null) {
-                    spotifyApi.saveToken(result.accessToken)
-                    result.refreshToken?.let { spotifyApi.saveRefreshToken(it) }
-                    viewModel?.onLoginComplete()
-                }
-            }
+            viewModel.handleAuthCallback(uri)
         }
     }
 }
 
 @Composable
-fun CuePointApp(vm: MainViewModel, onLogin: () -> Unit) {
+fun CuePointApp(vm: MainViewModel) {
     val uiState by vm.uiState.collectAsState()
 
     MaterialTheme {
-        if (!uiState.isLoggedIn) {
-            LoginScreen(onLogin = onLogin, errorMessage = uiState.errorMessage)
-        } else {
-            MainPager(vm, uiState)
+        when (uiState.authState) {
+            // Blank spinner instead of the login screen until the stored-token check finishes.
+            AuthState.Unknown -> Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                CircularProgressIndicator(modifier = Modifier.size(24.dp), strokeWidth = 2.dp)
+            }
+            AuthState.LoggedOut -> LoginScreen(onLogin = vm::login, errorMessage = uiState.loginError)
+            AuthState.LoggedIn -> MainPager(vm, uiState)
         }
     }
 }
 
 @Composable
-fun LoginScreen(onLogin: () -> Unit, errorMessage: String?) {
+fun LoginScreen
+(onLogin: () -> Unit, errorMessage: String?) {
     Scaffold(timeText = { TimeText() }) {
         Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
             Column(
@@ -202,6 +208,15 @@ fun SetupScreen(uiState: CuePointUiState, vm: MainViewModel) {
                     modifier = Modifier.width(80.dp)
                 )
             }
+
+            Spacer(modifier = Modifier.height(4.dp))
+
+            // Bottom of the Setup page (the reorder to page 1 is a later phase).
+            CompactChip(
+                onClick = vm::logout,
+                label = { Text("Log out") },
+                colors = ChipDefaults.secondaryChipColors()
+            )
         }
     }
 }
