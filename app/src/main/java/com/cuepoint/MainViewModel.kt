@@ -67,11 +67,11 @@ class MainViewModel(
             vibrate(30)
             try {
                 val wasPlaying = _uiState.value.isPlaying
-                val success = if (wasPlaying) spotifyApi.pause() else spotifyApi.play()
-                if (success) {
+                val result = if (wasPlaying) spotifyApi.pause() else spotifyApi.play()
+                if (result == CallResult.OK) {
                     _uiState.update { it.copy(isPlaying = !wasPlaying) }
                 } else {
-                    handleApiFailure("Playback failed")
+                    handleApiFailure(result, "Playback failed")
                 }
             } catch (e: Exception) {
                 showError("Network error")
@@ -87,15 +87,20 @@ class MainViewModel(
             vibrate(30)
             try {
                 // Pause before seeking to avoid a race condition where Spotify
-                // resumes mid-seek and ignores the position.
-                val pauseOk = spotifyApi.pause()
-                if (!pauseOk) { handleApiFailure("Could not pause"); return@launch }
+                // resumes mid-seek and ignores the position. Always pause: isPlaying isn't
+                // synced with Spotify yet (Phase 3) so it can be stale, and pause is idempotent
+                // (an already-paused 403 counts as OK). Skipping it can return once state is synced.
+                val pauseResult = spotifyApi.pause()
+                if (pauseResult != CallResult.OK) {
+                    handleApiFailure(pauseResult, "Could not pause")
+                    return@launch
+                }
 
-                val seekOk = spotifyApi.seek(_uiState.value.timeMs)
-                if (seekOk) {
+                val seekResult = spotifyApi.seek(_uiState.value.timeMs)
+                if (seekResult == CallResult.OK) {
                     _uiState.update { it.copy(isPlaying = false) }
                 } else {
-                    handleApiFailure("Seek failed")
+                    handleApiFailure(seekResult, "Seek failed")
                 }
             } catch (e: Exception) {
                 showError("Network error")
@@ -119,9 +124,12 @@ class MainViewModel(
 
     // --- Error handling ---
 
-    // Check if the failure was a 401 (token cleared by spotifyPut) — if so, go to login
-    private suspend fun handleApiFailure(fallbackMessage: String) {
-        if (!spotifyApi.isLoggedIn()) {
+    // Network errors get their own message; otherwise, if the tokens were cleared
+    // (refresh + retry both got 401), go to login.
+    private suspend fun handleApiFailure(result: CallResult, fallbackMessage: String) {
+        if (result == CallResult.NETWORK) {
+            showError("Network error")
+        } else if (!spotifyApi.isLoggedIn()) {
             _uiState.update { it.copy(isLoggedIn = false, errorMessage = "Session expired") }
         } else {
             showError(fallbackMessage)

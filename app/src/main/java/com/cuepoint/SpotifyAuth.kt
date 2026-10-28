@@ -3,15 +3,17 @@ package com.cuepoint
 import android.content.Context
 import android.content.Intent
 import android.net.Uri
+import android.util.Log
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import okhttp3.FormBody
-import okhttp3.OkHttpClient
 import okhttp3.Request
 import org.json.JSONObject
 import java.security.MessageDigest
 import java.security.SecureRandom
 import java.util.Base64
+
+private const val TAG = "SpotifyAuth"
 
 /**
  * Spotify OAuth 2.0 with PKCE (Proof Key for Code Exchange).
@@ -47,8 +49,6 @@ class SpotifyAuth(private val context: Context) {
         // Scope = permissions. We only need playback control.
         private const val SCOPE = "user-modify-playback-state user-read-playback-state"
     }
-
-    private val httpClient = OkHttpClient()
 
     // The code verifier must be kept between the authorize call and the callback.
     // In production you'd store it in DataStore; kept in memory here for simplicity.
@@ -88,7 +88,7 @@ class SpotifyAuth(private val context: Context) {
             )
             true
         } catch (e: SecurityException) {
-            println("Auth redirect failed — no paired phone? ${e.message}")
+            Log.w(TAG, "Auth redirect failed — no paired phone? ${e.message}")
             false
         }
     }
@@ -114,24 +114,24 @@ class SpotifyAuth(private val context: Context) {
                 .add("code_verifier", verifier)
                 .build()
 
-            val response = httpClient.newCall(
+            httpClient.newCall(
                 Request.Builder().url(TOKEN_URL).post(requestBody).build()
-            ).execute()
+            ).execute().use { response ->
+                val body = response.body?.string() ?: return@withContext null
 
-            val body = response.body?.string() ?: return@withContext null
-
-            if (response.isSuccessful) {
-                val json = JSONObject(body)
-                TokenPair(
-                    accessToken = json.getString("access_token"),
-                    refreshToken = json.optString("refresh_token").takeIf { it.isNotEmpty() }
-                )
-            } else {
-                println("Token exchange failed: $body")
-                null
+                if (response.isSuccessful) {
+                    val json = JSONObject(body)
+                    TokenPair(
+                        accessToken = json.getString("access_token"),
+                        refreshToken = json.optString("refresh_token").takeIf { it.isNotEmpty() }
+                    )
+                } else {
+                    Log.w(TAG, "Token exchange failed: $body")
+                    null
+                }
             }
         } catch (e: Exception) {
-            println("Auth error: ${e.message}")
+            Log.w(TAG, "Auth error: ${e.message}")
             null
         }
     }

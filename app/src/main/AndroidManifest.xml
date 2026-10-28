@@ -11,7 +11,7 @@
     <uses-feature android:name="android.hardware.type.watch" />
 
     <application
-        android:allowBackup="true"
+        android:allowBackup="false"
         android:label="CuePoint"
         android:supportsRtl="true"
         android:theme="@android:style/Theme.DeviceDefault">

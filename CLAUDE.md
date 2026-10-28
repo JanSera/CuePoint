@@ -56,9 +56,9 @@ The Spotify client ID is injected at build time from `local.properties` (`spotif
 ## Key Constraints
 
 - **Wear OS only** — `minSdk 30` (Wear OS 3+), round display assumed
-- **Spotify Premium required** — seek and playback control APIs require a Premium account; `403` means non-Premium user
+- **Spotify Premium required** — seek and playback control APIs require a Premium account; `403` means non-Premium user (except `403 "Restriction violated"` on pause, which means already paused and is treated as success)
 - **Active device required** — Spotify must be playing (or paused) on some device; `404` means no active player
-- **Token expiry** — access tokens last ~1 hour; on `401` the app refreshes the token and retries once; if refresh fails, tokens are cleared and the login screen is shown
+- **Token expiry** — access tokens last ~1 hour; on `401` the app refreshes the token (mutex-guarded, so concurrent callers share one refresh) and retries once; tokens are cleared and the login screen shown only when the refresh is rejected (400/401 or no refresh token) or the retry is also `401`. Network errors, 5xx on the token endpoint, 404 and other 403s never log out
 - `codeVerifier` in `SpotifyAuth` is kept in memory — app process kill between auth steps loses it (issue #6)
 - **Development mode** — a Spotify app in development mode requires the app owner to have Premium and allows at most 5 allowlisted users
 
