@@ -36,25 +36,31 @@ To test Spotify API calls without going through OAuth, paste a temporary token f
 
 ## Architecture
 
-Three files, single-Activity, no ViewModel layer yet:
+Single Activity, MVVM (one ViewModel exposing a `StateFlow<CuePointUiState>`), Compose for Wear OS:
 
 | File | Role |
 |------|------|
-| `MainActivity.kt` | Activity + all Compose UI in `CuePointApp()` |
-| `SpotifyApi.kt` | Spotify Web API calls (seek, play/pause); token storage via DataStore |
+| `MainActivity.kt` | Activity, OAuth callback forwarding, and all Compose UI: `LoginScreen`, `MainPager` (Wear `HorizontalPager`) with `SetupScreen` and `ControlScreen` |
+| `MainViewModel.kt` | UI state, play/pause/reset actions, time adjustment, error display, haptics |
+| `SpotifyApi.kt` | Spotify Web API calls (seek, play, pause, playback state); token + refresh-token storage via DataStore; transparent refresh-and-retry on 401 |
 | `SpotifyAuth.kt` | OAuth 2.0 PKCE flow; opens browser on paired phone via `Intent.ACTION_VIEW` |
 
-**Auth flow:** `SpotifyAuth.openAuthInBrowser()` → user logs in on phone → Spotify redirects to `cuepoint://callback` → `MainActivity.onNewIntent()` → `SpotifyAuth.handleCallback()` → token saved to DataStore via `SpotifyApi.saveToken()`.
+The Spotify client ID is injected at build time from `local.properties` (`spotify.clientId=...`) into `BuildConfig.SPOTIFY_CLIENT_ID`.
 
-**Token resolution** (`SpotifyApi.getToken()`): DataStore token → fallback to hardcoded `TEST_TOKEN` → null (triggers re-auth).
+**Auth flow:** `SpotifyAuth.openAuthInBrowser()` → user logs in on phone → Spotify redirects to `cuepoint://callback` → `MainActivity.onNewIntent()` → `SpotifyAuth.handleCallback()` → access + refresh tokens saved to DataStore → `MainViewModel.onLoginComplete()`.
+
+**Token resolution** (`SpotifyApi.getToken()`): DataStore token → fallback to hardcoded `TEST_TOKEN` → null (shows login screen).
+
+**Roadmap:** the remaining work is planned in `.wip/ROADMAP.md` (gitignored, local only).
 
 ## Key Constraints
 
 - **Wear OS only** — `minSdk 30` (Wear OS 3+), round display assumed
 - **Spotify Premium required** — seek and playback control APIs require a Premium account; `403` means non-Premium user
 - **Active device required** — Spotify must be playing (or paused) on some device; `404` means no active player
-- **Token expiry** — access tokens last ~1 hour; `401` clears the token and forces re-login (token refresh not yet implemented)
-- `codeVerifier` in `SpotifyAuth` is kept in memory — app process kill between auth steps loses it
+- **Token expiry** — access tokens last ~1 hour; on `401` the app refreshes the token and retries once; if refresh fails, tokens are cleared and the login screen is shown
+- `codeVerifier` in `SpotifyAuth` is kept in memory — app process kill between auth steps loses it (issue #6)
+- **Development mode** — a Spotify app in development mode requires the app owner to have Premium and allows at most 5 allowlisted users
 
 ## Spotify API Scopes
 
