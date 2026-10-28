@@ -98,13 +98,16 @@ fun CuePointApp(vm: MainViewModel) {
     // Re-read the real player state whenever the app comes back to the foreground. Lives here
     // (not in MainPager) so it is registered before login finishes; the VM ignores it unless logged in.
     LifecycleEventEffect(Lifecycle.Event.ON_RESUME) { vm.onResume() }
+    // No foreground service in v1, so the loop cannot be trusted once the app is hidden: disarm loudly.
+    LifecycleEventEffect(Lifecycle.Event.ON_STOP) { vm.onStop() }
 
     // Foreground resync every ~10 s while RESUMED and logged in, so a song change on the phone is
     // noticed (it loads that song's segment) before MARK/Reset act on a stale track.
-    // Phase 5's loop resync will replace or absorb this.
+    // Paused while the auto-stop loop is armed: the loop makes its own GETs (every ~5 s, see
+    // LoopController), and two pollers would overlap. Restarts (with a fresh 10 s wait) on disarm.
     val lifecycleOwner = LocalLifecycleOwner.current
-    LaunchedEffect(uiState.authState, lifecycleOwner) {
-        if (uiState.authState == AuthState.LoggedIn) {
+    LaunchedEffect(uiState.authState, uiState.loopArmed, lifecycleOwner) {
+        if (uiState.authState == AuthState.LoggedIn && !uiState.loopArmed) {
             lifecycleOwner.repeatOnLifecycle(Lifecycle.State.RESUMED) {
                 while (true) {
                     delay(10_000)   // ON_RESUME already synced once, so wait first
@@ -170,10 +173,12 @@ fun MainPager(vm: MainViewModel, uiState: CuePointUiState) {
         coroutineScope.launch { pagerState.animateScrollToPage(0) }
     }
 
-    // Screen stays on only on the Control page (Phase 5 changes this to "while armed").
+    // Screen stays on while the loop is armed (a dimmed screen could suspend the app and stop it) or
+    // while playing (Reset+Play without a "to" must not drop to the watch face mid-rehearsal), on any page.
+    // Otherwise the normal timeout applies.
     val activity = LocalContext.current as Activity
-    DisposableEffect(pagerState.currentPage) {
-        if (pagerState.currentPage == 0)
+    DisposableEffect(uiState.loopArmed || uiState.isPlaying) {
+        if (uiState.loopArmed || uiState.isPlaying)
             activity.window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         else
             activity.window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
@@ -381,6 +386,21 @@ fun ControlScreen(
         }
     }
 
+    Box(modifier = Modifier.fillMaxSize()) {
+    // Armed: a ring around the bezel filling from "from" to "to" as the song plays. Glanceable from
+    // across the room; its presence alone says "will auto-stop". Drawn first, so the content sits on top.
+    val to = uiState.toMs
+    if (uiState.loopArmed && to != null && playback != null) {
+        val span = (to - uiState.fromMs).coerceAtLeast(1L)
+        val progress = ((playback.positionAt(nowMs) - uiState.fromMs).toFloat() / span).coerceIn(0f, 1f)
+        CircularProgressIndicator(
+            progress = progress,
+            modifier = Modifier.fillMaxSize().padding(2.dp),
+            indicatorColor = Color(0xFF1DB954),
+            trackColor = Color(0xFF1B3B2A),
+            strokeWidth = 4.dp
+        )
+    }
     Scaffold(timeText = { TimeText() }) {
         Column(
             modifier = Modifier
@@ -415,7 +435,7 @@ fun ControlScreen(
             )
 
             Text(
-                text = uiState.toMs?.let { "${formatMs(uiState.fromMs)} → ${formatMs(it)}" }
+                text = uiState.toMs?.let { "${if (uiState.loopArmed) "LOOP " else ""}${formatMs(uiState.fromMs)} → ${formatMs(it)}" }
                     ?: "from ${formatMs(uiState.fromMs)}",
                 fontSize = 11.sp,
                 color = Color(0xFF1DB954),
@@ -470,5 +490,6 @@ fun ControlScreen(
                 }
             }
         }
+    }
     }
 }

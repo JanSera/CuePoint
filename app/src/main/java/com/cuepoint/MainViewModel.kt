@@ -13,6 +13,7 @@ import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.viewModelScope
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -27,6 +28,13 @@ enum class AuthState { Unknown, LoggedIn, LoggedOut }
 
 // Which end of the segment the crown / bezel and the +/- buttons act on.
 enum class SegmentField { From, To }
+
+// The loop counts as "in range" this far before "from" (Play starts at from, but the first GET
+// after it can read slightly earlier) ...
+private const val PRE_ROLL_MS = 2_000L
+// ... and, once armed, this far past "to" (a late resync that sees us just past the target still
+// lets the loop fire). Further past = someone seeked on the phone.
+private const val OVERSHOOT_GRACE_MS = 1_500L
 
 // MARK subtracts this from the extrapolated position: the finger lags the music by roughly this much.
 const val REACTION_OFFSET_MS = 300L
@@ -44,7 +52,9 @@ data class CuePointUiState(
     val authState: AuthState = AuthState.Unknown,
     // Shown on the login screen. Unlike errorMessage it does not auto-clear: it stays until the
     // next login tap, so a glance at the watch later still explains what happened.
-    val loginError: String? = null
+    val loginError: String? = null,
+    // True while the auto-stop loop is waiting for "to": drives the progress ring and keeps the screen on.
+    val loopArmed: Boolean = false
 )
 
 // AndroidViewModel (not plain ViewModel) because we need Application context for haptics.
@@ -68,6 +78,32 @@ class MainViewModel(
     }
 
     private var errorClearJob: Job? = null
+
+    // The auto-stop timer (see LoopController.kt). It decides when to fire; this class decides
+    // whether it is armed (evaluateLoop). It reads the same clock as PlaybackState.sampledAtElapsedMs.
+    private val loop = LoopController(
+        spotifyApi, SystemClock::elapsedRealtime, viewModelScope,
+        object : LoopController.Listener {
+            override suspend fun onSynced(result: ApiResult<PlaybackState?>) {
+                applySyncResult(result, silent = true)
+            }
+            override fun onFired(fromMs: Long, atElapsedMs: Long) = loopFired(fromMs, atElapsedMs)
+            override fun onFireFailed(result: ApiResult<*>, message: String) = loopFireFailed(result, message)
+        }
+    )
+
+    // True while togglePlayPause/resetToTime run: they own the player state, so a sync landing in
+    // between must not arm or disarm the loop (it would see a half-done action). evaluateLoop() runs
+    // once when the action ends. Main thread only.
+    private var userActionInFlight = false
+
+    // Set by onResume/onStop. The loop only arms while true. Starts false: ON_RESUME arrives right after creation.
+    private var isForeground = false
+
+    // elapsedRealtime of the last local re-anchor after a PUT. A GET sampled before it describes the
+    // player from before that PUT and is dropped; otherwise a slow GET landing after a fire could
+    // show "playing" and re-arm the loop. Main thread only.
+    private var localAnchorAtMs = 0L
 
     // Track whose segment is currently shown, and the key segment edits are saved under.
     // Null until the first synced track. It is NOT reset by an ad/podcast (trackId null): the values
@@ -148,6 +184,7 @@ class MainViewModel(
         viewModelScope.launch {
             spotifyApi.clearTokens()
             _uiState.update { it.copy(authState = AuthState.LoggedOut, loginError = null) }
+            evaluateLoop()   // not logged in: disarms quietly
         }
     }
 
@@ -174,10 +211,19 @@ class MainViewModel(
     private enum class SyncOutcome { Failed, Unchanged, TrackChanged }
 
     // One GET + state update; shared by syncPlayback() and resetToTime(). Shows its own error on failure.
-    private suspend fun syncPlaybackOnce(silent: Boolean = false): SyncOutcome {
-        when (val result = spotifyApi.getPlaybackState()) {
+    private suspend fun syncPlaybackOnce(silent: Boolean = false): SyncOutcome =
+        applySyncResult(spotifyApi.getPlaybackState(), silent)
+
+    // The state update for a GET result. Also the entry point for the loop's own resyncs, so a song
+    // change noticed by the loop loads its segment exactly like one noticed by the 10 s sync.
+    private suspend fun applySyncResult(result: ApiResult<PlaybackState?>, silent: Boolean): SyncOutcome {
+        when (result) {
             is ApiResult.Ok -> {
                 val state = result.value
+                if (state != null && state.sampledAtElapsedMs < localAnchorAtMs) return SyncOutcome.Unchanged   // stale, see localAnchorAtMs
+                // Overlapping GETs can land out of order: never go back to an older snapshot.
+                val current = _uiState.value.playback
+                if (state != null && current != null && state.sampledAtElapsedMs < current.sampledAtElapsedMs) return SyncOutcome.Unchanged
                 // A different song: swap in its stored segment (or the empty default). A null
                 // trackId (ad, podcast, local file) or no player leaves the values alone.
                 val trackId = state?.trackId
@@ -187,11 +233,19 @@ class MainViewModel(
                 val stored = if (changed) {
                     try {
                         segmentStore.load(trackId!!)
+                    } catch (e: CancellationException) {
+                        // Runs inside the loop's job on its own resyncs; a disarm mid-load must abort the
+                        // whole update, not fall back to the default segment and overwrite the saved one.
+                        throw e
                     } catch (e: Exception) {
                         Log.w("MainViewModel", "Loading segment failed: ${e.message}")
                         null
                     }
                 } else null
+                // A song change while armed is a loud disarm. It must happen BEFORE the swap below, or evaluateLoop
+                // would see the new song as the loaded one. No suspension point after the load, so the
+                // cancel this causes cannot interrupt the state update.
+                if (changed && loop.isArmed) disarmLoop("Different song")
                 if (changed) loadedTrackId = trackId
                 _uiState.update {
                     val synced = it.copy(playback = state, isPlaying = state?.isPlaying ?: false)
@@ -203,6 +257,7 @@ class MainViewModel(
                     }
                 }
                 lastSyncFailed = false
+                evaluateLoop()
                 return if (changed) SyncOutcome.TrackChanged else SyncOutcome.Unchanged
             }
             else -> {
@@ -210,6 +265,7 @@ class MainViewModel(
                 // known state and just show the error.
                 if (result == ApiResult.NoActiveDevice) {
                     _uiState.update { it.copy(playback = null, isPlaying = false) }
+                    evaluateLoop()
                 }
                 // Silent: state effects above/below still apply (Unauthorized logs out), only the text is skipped.
                 if (!silent || result == ApiResult.Unauthorized || !lastSyncFailed) {
@@ -223,38 +279,51 @@ class MainViewModel(
 
     // ON_RESUME hook. LoggedIn only: before that there is no token, and init/login sync themselves.
     fun onResume() {
+        isForeground = true   // before the login check: the flag must be right even while logged out/Unknown
         if (_uiState.value.authState == AuthState.LoggedIn) syncPlayback()
     }
 
     fun togglePlayPause() {
         viewModelScope.launch {
             _uiState.update { it.copy(isLoading = true) }
+            userActionInFlight = true
             vibrate(30)
             try {
                 // isPlaying is kept in sync with Spotify (see syncPlayback), so it is a reliable toggle basis.
                 val wasPlaying = _uiState.value.isPlaying
+                // Pausing from the watch ends the loop quietly (it is not an "external" pause).
+                if (wasPlaying) disarmLoop()
+                val start = SystemClock.elapsedRealtime()
                 val result = if (wasPlaying) spotifyApi.pause() else spotifyApi.play()
                 if (result is ApiResult.Ok) {
+                    val now = SystemClock.elapsedRealtime()
+                    loop.recordRoundTrip(now - start)
                     // Re-anchor the local snapshot so the position stays right without another GET:
                     // freeze/resume from where it is extrapolated to right now.
-                    // `now` is taken after the PUT returned, so the position overshoots by about
-                    // RTT/2; Phase 5's RTT estimate can correct it.
-                    val now = SystemClock.elapsedRealtime()
+                    // The PUT took effect on Spotify's side about RTT/2 before it returned, so
+                    // anchor there rather than at `now` (which would overshoot by that much).
+                    val landed = now - loop.rttEstimateMs / 2
+                    localAnchorAtMs = now
                     _uiState.update {
                         it.copy(
                             isPlaying = !wasPlaying,
                             playback = it.playback?.let { p ->
-                                p.copy(isPlaying = !wasPlaying, progressMs = p.positionAt(now), sampledAtElapsedMs = now)
+                                p.copy(isPlaying = !wasPlaying, progressMs = p.positionAt(landed), sampledAtElapsedMs = landed)
                             }
                         )
                     }
+                    // After a play, read the real position: the loop's first timing is
+                    // only as good as its anchor.
+                    if (!wasPlaying) resyncAfterPlay(now)
                 } else {
                     handleApiFailure(result, "Playback failed")
                 }
             } catch (e: Exception) {
                 showError("No connection")
             } finally {
+                userActionInFlight = false
                 _uiState.update { it.copy(isLoading = false) }
+                evaluateLoop()   // arms after a successful play; re-arms if the action failed and nothing changed
             }
         }
     }
@@ -262,6 +331,8 @@ class MainViewModel(
     fun resetToTime() {
         viewModelScope.launch {
             _uiState.update { it.copy(isLoading = true) }
+            userActionInFlight = true
+            disarmLoop()   // the user is taking over; the pause below is theirs, not an external one
             vibrate(30)
             try {
                 // The song may have changed on the phone since the last sync. Check first: seeking a
@@ -287,10 +358,13 @@ class MainViewModel(
                 }
 
                 val fromMs = _uiState.value.fromMs
+                val seekStart = SystemClock.elapsedRealtime()
                 val seekResult = spotifyApi.seek(fromMs)
                 if (seekResult is ApiResult.Ok) {
                     // We paused and seeked, so the position is known exactly: no GET needed.
                     val now = SystemClock.elapsedRealtime()
+                    loop.recordRoundTrip(now - seekStart)
+                    localAnchorAtMs = now
                     _uiState.update {
                         it.copy(
                             isPlaying = false,
@@ -303,7 +377,117 @@ class MainViewModel(
             } catch (e: Exception) {
                 showError("No connection")
             } finally {
+                userActionInFlight = false
                 _uiState.update { it.copy(isLoading = false) }
+                evaluateLoop()
+            }
+        }
+    }
+
+    // Spotify often still reports is_playing=false (old position) for a moment after a play PUT, so wait
+    // before the GET, and if it still says paused within 1.5 s of our own successful play, retry once.
+    private suspend fun resyncAfterPlay(playOkAtMs: Long) {
+        delay(600)
+        var result = spotifyApi.getPlaybackState()
+        val stalePaused = (result as? ApiResult.Ok)?.value?.isPlaying == false
+        if (stalePaused && SystemClock.elapsedRealtime() - playOkAtMs < 1_500) {
+            delay(600)
+            result = spotifyApi.getPlaybackState()
+        }
+        applySyncResult(result, silent = true)
+    }
+
+    // --- Auto-stop loop ---
+
+    // Armed = logged in, "to" set, the loaded song is playing, position in [from - 2 s, to).
+    // Called after every change that can affect it; cheap and idempotent. Disarming is quiet when the
+    // user caused it (to cleared, paused from the watch, segment edits) and loud (haptic + status)
+    // when something else did: other song, external pause, a seek on the phone.
+    // quiet = the call comes from a segment edit, so "now out of range" was the user's doing.
+    private fun evaluateLoop(quiet: Boolean = false) {
+        // isFiring: between the loop's pause and seek a GET reads "paused", which is ours, not external.
+        if (userActionInFlight || loop.isFiring) return
+        // Hidden app = no loop (the VM can still be alive). Also stops a late play/sync from re-arming after ON_STOP.
+        if (!isForeground) {
+            disarmLoop()
+            return
+        }
+        val s = _uiState.value
+        val to = s.toMs
+        val p = s.playback
+        if (s.authState != AuthState.LoggedIn || to == null) {
+            disarmLoop()
+            return
+        }
+        val armed = loop.isArmed
+        // null = arm (or keep armed); "" = disarm quietly; otherwise disarm loudly with this text.
+        val stopReason: String? = when {
+            p == null -> "Loop stopped"
+            loadedTrackId == null || p.trackId != loadedTrackId -> "Different song"
+            !p.isPlaying -> "Loop stopped"
+            else -> {
+                val pos = p.positionAt(SystemClock.elapsedRealtime())
+                val low = s.fromMs - PRE_ROLL_MS
+                // Armed tolerates a small overshoot (the loop is about to fire); arming needs pos < to.
+                val high = if (armed) to + OVERSHOOT_GRACE_MS else to - 1
+                if (pos in low..high) null else if (quiet) "" else "Loop stopped"
+            }
+        }
+        if (stopReason == null) {
+            loop.arm(s.fromMs, to, p!!)
+        } else if (armed) {
+            disarmLoop(stopReason.ifEmpty { null })
+        }
+        syncArmedFlag()
+    }
+
+    // message != null: loud disarm (haptic + status line). null: silent.
+    private fun disarmLoop(message: String? = null) {
+        val wasArmed = loop.isArmed
+        loop.disarm()
+        if (wasArmed && message != null) {
+            vibrate(150)
+            showError(message)
+        }
+        syncArmedFlag()
+    }
+
+    private fun syncArmedFlag() {
+        val armed = loop.isArmed
+        if (_uiState.value.loopArmed != armed) _uiState.update { it.copy(loopArmed = armed) }
+    }
+
+    // ON_STOP hook: no foreground service in v1, so the loop cannot be trusted once the app is hidden.
+    // ON_STOP during a fire still completes the seek: the controller shields pause+seek from
+    // cancellation on purpose, so the song is never left paused mid-segment.
+    fun onStop() {
+        isForeground = false
+        disarmLoop("Loop stopped — app closed")
+    }
+
+    // The loop paused and seeked back. Same local re-anchor as resetToTime: paused, exactly at from.
+    private fun loopFired(fromMs: Long, atElapsedMs: Long) {
+        localAnchorAtMs = atElapsedMs
+        _uiState.update {
+            it.copy(
+                isPlaying = false,
+                loopArmed = false,
+                playback = it.playback?.copy(isPlaying = false, progressMs = fromMs, sampledAtElapsedMs = atElapsedMs)
+            )
+        }
+        // Strong and unmistakable: three pulses (the tap is 30 ms, the disarm buzz 150 ms).
+        vibrator.vibrate(VibrationEffect.createWaveform(longArrayOf(0, 250, 120, 250, 120, 250), -1))
+    }
+
+    // Pause or seek failed. We no longer know the player state (the pause may have worked), so re-read it.
+    private fun loopFireFailed(result: ApiResult<*>, message: String) {
+        _uiState.update { it.copy(loopArmed = false) }
+        handleApiFailure(result, message)
+        viewModelScope.launch {
+            try {
+                syncPlaybackOnce(silent = true)
+            } catch (e: Exception) {
+                lastSyncFailed = true
             }
         }
     }
@@ -343,6 +527,7 @@ class MainViewModel(
     fun clearTo() {
         _uiState.update { it.copy(toMs = null) }
         persistSegment()
+        evaluateLoop()   // no "to": disarms quietly
     }
 
     private fun setField(field: SegmentField, ms: Long) {
@@ -364,6 +549,7 @@ class MainViewModel(
             }
         }
         persistSegment()
+        evaluateLoop(quiet = true)
     }
 
     // Saves after every change. No track id (ad, nothing synced yet) = nothing to key it under.
@@ -388,8 +574,10 @@ class MainViewModel(
     private fun handleApiFailure(result: ApiResult<*>, fallbackMessage: String) {
         when (result) {
             is ApiResult.Ok -> Unit   // not a failure
-            ApiResult.Unauthorized ->
+            ApiResult.Unauthorized -> {
                 _uiState.update { it.copy(authState = AuthState.LoggedOut, loginError = "Session expired") }
+                evaluateLoop()   // not logged in: disarms quietly
+            }
             ApiResult.NoActiveDevice -> showError("Open Spotify on a device")
             ApiResult.PremiumRequired -> showError("Spotify Premium required")
             ApiResult.Network -> showError("No connection")
